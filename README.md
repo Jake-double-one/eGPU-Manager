@@ -7,7 +7,7 @@ Built for a Dell Precision 5570 with an **RTX A2000 8GB Laptop GPU** (internal) 
 *Deutsche Kurzfassung: [siehe unten](#deutsch).*
 
 ## Screenshot
-<img width="1102" height="989" alt="image" src="https://github.com/user-attachments/assets/9ad3e799-5098-45b3-b1ac-ce136ed1b391" />
+<img width="1127" height="989" alt="image" src="https://github.com/user-attachments/assets/d2bb114b-5484-4f23-b456-b800ce2d2508" />
 
 ## The problem
 
