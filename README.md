@@ -31,6 +31,9 @@ Mit **derselben Version für beide Karten** laufen A2000 und 4070 gleichzeitig. 
 - [7-Zip](https://www.7-zip.org/) unter `C:\Program Files\7-Zip\7z.exe` (zum Prüfen und Entpacken der NVIDIA-Pakete)
 - Adminrechte (das Werkzeug fordert sie beim Start selbst an)
 
+## Screenshot
+<img width="1102" height="989" alt="image" src="https://github.com/user-attachments/assets/9ad3e799-5098-45b3-b1ac-ce136ed1b391" />
+
 ## Start
 
 ```powershell
