@@ -1,10 +1,12 @@
-# Persönliche Konfiguration (wird beim ersten Start automatisch angelegt)
+# Personal configuration (created automatically on first start)
 config.json
 
-# NVIDIA-Treiberpakete (~900 MB pro Version, nicht weiterverteilbar)
+# NVIDIA driver packages (~900 MB per version, not redistributable)
+Packages/
 Pakete/
 
-# Arbeitsdateien
+# Working files
 *.log
 *.tmp
+*.bak
 _dbg.ps1

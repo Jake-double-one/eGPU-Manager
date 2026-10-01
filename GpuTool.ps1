@@ -1,18 +1,21 @@
 ﻿<#
-  GpuTool.ps1  -  GPU-Verwaltung
-  Gemeinsame NVIDIA-Treiberversion für RTX A2000 (intern) und RTX 4070 (eGPU im Razer Core X)
+  GpuTool.ps1  -  eGPU Manager
+  Keeps an internal NVIDIA GPU and an NVIDIA eGPU on the same driver version.
+  Built for: RTX A2000 Laptop GPU (internal) + GeForce RTX 4070 (Razer Core X, Thunderbolt)
+  https://github.com/Jake-double-one/eGPU-Manager  -  MIT License
 
-  Hintergrund:
-    Beide Karten nutzen denselben Kerneltreiber nvlddmkm.sys. Mit unterschiedlichen Treiberversionen
-    startet eine der Karten nicht (Code 31/43). Mit derselben Version laufen beide gleichzeitig.
+  Background:
+    Both cards use the same kernel driver nvlddmkm.sys, and Windows loads only one version of it.
+    With different driver versions one card fails to start (code 31/43). With the same version
+    both cards run side by side.
 
-  Start:    Desktop-Verknüpfung "GPU-Verwaltung" (fordert Adminrechte an)
-  Konsole:  GpuTool.ps1 -Status            Zustand anzeigen
-            GpuTool.ps1 -Apply 596.36      abgelegte Version sofort installieren (Adminrechte)
-  Intern:   -Apply <Version> -FromTask     einmaliger geplanter Wechsel, die Aufgabe löscht sich danach selbst
-            -LoadCore                      nur Funktionen laden (für Hintergrundarbeiten der Oberfläche)
+  Start:    desktop shortcut "eGPU Manager" (requests administrator rights)
+  Console:  GpuTool.ps1 -Status            show status
+            GpuTool.ps1 -Apply 596.36      install a stored version now (administrator rights)
+  Internal: -Apply <version> -FromTask     one-time scheduled switch, the task deletes itself afterwards
+            -LoadCore                      load functions only (used by the GUI's background work)
 
-  Dateien:  config.json, Pakete\<Version>\*.exe (Original-Installer von NVIDIA, wird vor jeder Nutzung geprüft)
+  Files:    config.json, Packages\<version>\*.exe (original NVIDIA installer, verified before every use)
   Log:      C:\ProgramData\GpuTool\gpu-tool.log
 #>
 param(
@@ -22,27 +25,215 @@ param(
     [switch]$LoadCore,
     [switch]$NoElevate,
     [string]$Snapshot,
-    [ValidateSet('', 'Light', 'Dark')][string]$Theme = ''   # leer = Windows-Einstellung folgen
+    [ValidateSet('', 'Light', 'Dark')][string]$Theme = '',   # empty = use setting
+    [ValidateSet('', 'en', 'de')][string]$Lang = ''          # empty = use setting
 )
 
 $Global:GT = @{
+    Version    = '1.1.0'
+    Repo       = 'Jake-double-one/eGPU-Manager'
+    AppName    = 'eGPU Manager'
     Self       = $PSCommandPath
     Root       = $PSScriptRoot
     ConfigFile = Join-Path $PSScriptRoot 'config.json'
-    PkgDir     = Join-Path $PSScriptRoot 'Pakete'
+    PkgDir     = Join-Path $PSScriptRoot 'Packages'
     DataDir    = Join-Path $env:ProgramData 'GpuTool'
-    TaskName   = 'GpuTool-Treiberwechsel'
+    TaskName   = 'eGPU-Manager-DriverSwitch'
     InstallDir = 'C:\Scripts\GpuTool'
     SevenZip   = 'C:\Program Files\7-Zip\7z.exe'
     Api        = 'https://gfwsl.geforce.com/services_toolkit/services/com/nvidia/services/AjaxDriverService.php'
+    Lang       = 'en'
 }
+$GT.RepoUrl    = "https://github.com/$($GT.Repo)"
 $GT.LogFile    = Join-Path $GT.DataDir 'gpu-tool.log'
 $GT.WorkDir    = Join-Path $GT.DataDir 'work'
-$GT.ResultFile = Join-Path $GT.DataDir 'letzter-wechsel.json'
+$GT.ResultFile = Join-Path $GT.DataDir 'last-switch.json'
 New-Item -ItemType Directory -Force -Path $GT.DataDir | Out-Null
 
 # =============================================================================================
-#  Grundfunktionen
+#  Strings (English, German)
+# =============================================================================================
+
+$Global:GTStrings = @{
+    # --- formats ---
+    'fmt.date'            = @('yyyy-MM-dd', 'dd.MM.yyyy')
+    'fmt.datetime'        = @('yyyy-MM-dd HH:mm', 'dd.MM.yyyy HH:mm')
+    'fmt.human'           = @('YYYY-MM-DD HH:MM', 'TT.MM.JJJJ HH:MM')
+    'yes'                 = @('yes', 'ja')
+    'no'                  = @('no', 'nein')
+
+    # --- status / logs ---
+    'log.status'          = @('Status: {0} | NVIDIA: {1} versions, {2} shared, newest shared {3}', 'Status: {0} | NVIDIA: {1} Versionen, {2} gemeinsam, neueste gemeinsame {3}')
+    'log.common'          = @('shared version {0}', 'gemeinsame Version {0}')
+    'log.mismatch'        = @('MISMATCH ({0})', 'ABWEICHUNG ({0})')
+    'log.error'           = @('ERROR: {0}', 'FEHLER: {0}')
+    'gpu.absent'          = @('not connected', 'nicht angeschlossen')
+    'gpu.code'            = @('{0}, code {1}', '{0}, Code {1}')
+
+    # --- download / verify ---
+    'prog.download'       = @('Download {0:N0} of {1:N0} MB', 'Download {0:N0} von {1:N0} MB')
+    'err.incomplete'      = @('Download incomplete ({0} of {1} bytes)', 'Download unvollständig ({0} von {1} Bytes)')
+    'log.downloaded'      = @('  Download complete ({0:N0} bytes)', '  Download vollständig ({0:N0} Bytes)')
+    'err.7zip'            = @('7-Zip not found ({0})', '7-Zip nicht gefunden ({0})')
+    'prog.sig'            = @('Checking signature ...', 'Prüfe Signatur ...')
+    'err.sig'             = @('Invalid signature ({0}, {1})', 'Signatur ungültig ({0}, {1})')
+    'log.sigok'           = @('  Signature valid (NVIDIA Corporation)', '  Signatur gültig (NVIDIA Corporation)')
+    'prog.archive'        = @('Testing archive ...', 'Teste Archiv ...')
+    'err.archive'         = @('Archive test failed', 'Archivtest fehlgeschlagen')
+    'log.archiveok'       = @('  Archive test passed', '  Archivtest fehlerfrei')
+    'prog.infs'           = @('Checking driver files ...', 'Prüfe Treiberdateien ...')
+    'err.notinpkg'        = @('{0} is not included in this package', '{0} ist in diesem Paket nicht enthalten')
+    'log.devinf'          = @('  {0}: {1}, driver version {2}', '  {0}: {1}, Treiberversion {2}')
+    'err.vermix'          = @('Different driver versions in package: {0}', 'Unterschiedliche Treiberversionen im Paket: {0}')
+    'err.catalog'         = @('Driver catalog is not validly signed ({0})', 'Treiberkatalog nicht gültig signiert ({0})')
+    'log.catok'           = @('  Driver catalog validly signed', '  Treiberkatalog gültig signiert')
+    'err.nourl'           = @('No download URL for {0}', 'Keine Download-Adresse für {0}')
+    'log.import'          = @('Downloading and verifying {0}', 'Lade und prüfe {0}')
+    'log.imported'        = @('Verified and stored: {0} ({1}) - both cards included', 'Geprüft und abgelegt: {0} ({1}) - beide Karten enthalten')
+    'log.removedpkg'      = @('Removed old package: {0}', 'Altes Paket entfernt: {0}')
+    'log.migrated'        = @('Moved package folder Pakete -> Packages', 'Paketordner verschoben: Pakete -> Packages')
+
+    # --- switch ---
+    'err.admin'           = @('Administrator rights are required to switch drivers', 'Für den Treiberwechsel sind Adminrechte nötig')
+    'err.notlocal'        = @('Version {0} is not stored locally - download and verify it first', 'Version {0} ist nicht lokal abgelegt - zuerst laden und prüfen')
+    'log.switch'          = @('Switching to {0} ({1})', 'Wechsel auf {0} ({1})')
+    'prog.pkg'            = @('Checking package ...', 'Prüfe Paket ...')
+    'err.pkgmissing'      = @('Package file missing: {0}', 'Paketdatei fehlt: {0}')
+    'err.hash'            = @('Checksum mismatch - the package has been modified', 'Prüfsumme stimmt nicht - Paket wurde verändert')
+    'err.sigshort'        = @('Invalid signature', 'Signatur ungültig')
+    'log.pkgok'           = @('  Package unchanged, signature valid', '  Paket unverändert, Signatur gültig')
+    'prog.extract'        = @('Extracting driver ...', 'Entpacke Treiber ...')
+    'err.extract'         = @('Extraction failed', 'Entpacken fehlgeschlagen')
+    'err.infmissing'      = @('{0} missing in package', '{0} fehlt im Paket')
+    'prog.remove'         = @('Removing {0} ...', 'Entferne {0} ...')
+    'log.removed'         = @('  removed {0} ({1}, {2}) -> exit {3}', '  entfernt {0} ({1}, {2}) -> Exit {3}')
+    'prog.install'        = @('Installing {0} ...', 'Installiere {0} ...')
+    'log.installed'       = @('  installed {0} -> exit {1}', '  installiert {0} -> Exit {1}')
+    'msg.switchok'        = @('Both cards now use the shared version {0}.', 'Beide Karten nutzen jetzt die gemeinsame Version {0}.')
+    'msg.switchreboot'    = @('Driver {0} is installed. Restart the laptop to complete the switch.', 'Treiber {0} ist installiert. Bitte den Laptop neu starten, um den Wechsel abzuschließen.')
+    'msg.applyfail'       = @('Switch to {0} failed: {1}', 'Wechsel auf {0} fehlgeschlagen: {1}')
+    'err.applyadmin'      = @('Aborted: -Apply requires administrator rights', 'Abbruch: -Apply braucht Adminrechte')
+
+    # --- scheduling / folder ---
+    'log.secured'         = @('Folder permissions secured ({0}) -> exit {1}', 'Ordnerrechte abgesichert ({0}) -> Exit {1}')
+    'err.notsecure'       = @("Folder {0} isn't secured - click 'Secure folder' first", "Ordner {0} ist nicht abgesichert - zuerst 'Rechte absichern'")
+    'when.reboot'         = @('at next restart', 'beim nächsten Neustart')
+    'task.desc'           = @('eGPU Manager: one-time switch to NVIDIA {0} ({1}). Deletes itself after running.', 'eGPU Manager: einmaliger Wechsel auf NVIDIA {0} ({1}). Löscht sich nach dem Lauf selbst.')
+    'log.scheduled'       = @('Switch to {0} scheduled: {1}', 'Wechsel auf {0} geplant: {1}')
+    'log.unscheduled'     = @('Scheduled switch cancelled', 'Geplanter Wechsel abgebrochen')
+
+    # --- install / update ---
+    'log.install'         = @('Installing to {0}', 'Installiere nach {0}')
+    'log.existing'        = @('  existing installation found - settings and packages are kept', '  vorhandene Installation gefunden - Einstellungen und Pakete bleiben erhalten')
+    'prog.copypkg'        = @('Copying driver packages ...', 'Kopiere Treiberpakete ...')
+    'log.copiedpkg'       = @('  driver packages copied', '  Treiberpakete übernommen')
+    'log.shortcut'        = @('Desktop shortcut created: {0}', 'Desktop-Verknüpfung angelegt: {0}')
+    'lnk.desc'            = @('Keep the internal NVIDIA GPU and the eGPU on the same driver version', 'Interne NVIDIA-GPU und eGPU auf derselben Treiberversion halten')
+    'log.update'          = @('Updating eGPU Manager {0} -> {1}', 'Aktualisiere eGPU Manager {0} -> {1}')
+    'log.updated'         = @('Updated to {0} (backup: {1})', 'Aktualisiert auf {0} (Sicherung: {1})')
+    'err.devcopy'         = @('This is a development copy (git repository) - update it with git pull', 'Das ist eine Entwicklerkopie (Git-Repository) - bitte mit git pull aktualisieren')
+    'err.update.parse'    = @('The downloaded script contains errors - update aborted', 'Das heruntergeladene Script enthält Fehler - Update abgebrochen')
+    'err.update.version'  = @('The downloaded script has an unexpected version - update aborted', 'Das heruntergeladene Script hat eine unerwartete Version - Update abgebrochen')
+
+    # --- console ---
+    'con.store'           = @('Driver store', 'Treiberspeicher')
+    'con.ok'              = @('OK: shared version {0}', 'OK: gemeinsame Version {0}')
+    'con.mismatch'        = @('MISMATCH: {0}', 'ABWEICHUNG: {0}')
+    'con.pending'         = @('Scheduled: switch to {0} {1}', 'Geplant: Wechsel auf {0} {1}')
+
+    # --- GUI ---
+    'ui.loading'          = @('Loading status ...', 'Lade Status ...')
+    'ui.versions'         = @('Driver versions (NVIDIA)', 'Treiberversionen (NVIDIA)')
+    'col.version'         = @('Version', 'Version')
+    'col.for'             = @('for {0}', 'für {0}')
+    'col.shared'          = @('Shared', 'Gemeinsam')
+    'col.local'           = @('Local', 'Lokal')
+    'col.status'          = @('Status', 'Status')
+    'ui.showall'          = @('Show all versions', 'Alle Versionen anzeigen')
+    'ui.refresh'          = @('Refresh', 'Aktualisieren')
+    'ui.download'         = @('Download and verify', 'Laden und prüfen')
+    'ui.switchgroup'      = @('Switch to selected version', 'Auf ausgewählte Version wechseln')
+    'ui.now'              = @('Now', 'Jetzt')
+    'ui.atreboot'         = @('At next restart', 'Beim nächsten Neustart')
+    'ui.at'               = @('At', 'Um')
+    'ui.switch'           = @('Switch', 'Wechseln')
+    'ui.nopending'        = @('No switch scheduled.', 'Kein Wechsel geplant.')
+    'ui.pending'          = @('Scheduled: switch to {0} {1}.', 'Geplant: Wechsel auf {0} {1}.')
+    'ui.cancelpending'    = @('Cancel scheduled switch', 'Geplanten Wechsel abbrechen')
+    'ui.repair'           = @('Repair mismatch', 'Abweichung reparieren')
+    'ui.secure'           = @('Secure folder', 'Rechte absichern')
+    'ui.openlog'          = @('Open log', 'Log öffnen')
+    'ui.theme'            = @('Theme:', 'Darstellung:')
+    'ui.lang'             = @('Language:', 'Sprache:')
+    'opt.auto'            = @('Automatic', 'Automatisch')
+    'opt.light'           = @('Light', 'Hell')
+    'opt.dark'            = @('Dark', 'Dunkel')
+    'ui.install'          = @('Install tool', 'Tool installieren')
+    'ui.reinstall'        = @('Recreate shortcut', 'Verknüpfung erneuern')
+    'ui.tooldir'          = @('Open tool folder', 'Tool-Ordner öffnen')
+    'ui.update'           = @('Update to {0}', 'Update auf {0}')
+    'ui.dev'              = @('dev', 'dev')
+    'st.ok'               = @('OK', 'OK')
+    'st.disabled'         = @('disabled', 'deaktiviert')
+    'st.error'            = @('Error code {0}', 'Fehler Code {0}')
+    'card.driver'         = @('Driver {0}  ({1})', 'Treiber {0}  ({1})')
+    'ban.store'           = @('Driver store: {0}', 'Treiberspeicher: {0}')
+    'ban.ok'              = @('Both cards use the shared version {0}.', 'Beide Karten nutzen die gemeinsame Version {0}.')
+    'ban.mismatch'        = @("Driver versions differ ({0}). 'Repair mismatch' restores {1}.", "Treiberversionen weichen ab ({0}). 'Abweichung reparieren' stellt {1} wieder her.")
+    'ban.offline'         = @('NVIDIA version list unavailable: {0}', 'NVIDIA-Versionsliste nicht erreichbar: {0}')
+    'ls.installed'        = @('installed', 'installiert')
+    'ls.ready'            = @('verified, ready to switch', 'geprüft, bereit zum Wechseln')
+    'ls.shared'           = @('listed for both cards, not downloaded', 'für beide Karten gelistet, nicht geladen')
+    'ls.notfor'           = @('not listed for {0}', 'nicht für {0} gelistet')
+    'prog.loading'        = @('Loading status and version list ...', 'Lade Status und Versionsliste ...')
+    'prog.downloading'    = @('Downloading {0} ...', 'Lade {0} ...')
+    'prog.switching'      = @('Switching to {0} ...', 'Wechsle auf {0} ...')
+    'prog.repair'         = @('Repairing ({0}) ...', 'Repariere ({0}) ...')
+    'prog.installing'     = @('Installing ...', 'Installiere ...')
+    'prog.updating'       = @('Updating ...', 'Aktualisiere ...')
+    'msg.select'          = @('Select a version in the list first.', 'Bitte zuerst eine Version in der Liste auswählen.')
+    'msg.lastswitch'      = @("Scheduled switch on {0}:`n`n{1}", "Geplanter Wechsel vom {0}:`n`n{1}")
+    'msg.switchfail'      = @("Switch failed:`n`n{0}", "Wechsel fehlgeschlagen:`n`n{0}")
+    'ask.rebootnow'       = @("{0}`n`nRestart now?", "{0}`n`nJetzt neu starten?")
+    'msg.alreadylocal'    = @('{0} is already downloaded and verified.', '{0} ist bereits geladen und geprüft.')
+    'msg.nourl'           = @('No download URL is known for {0}.', 'Für {0} ist keine Download-Adresse bekannt.')
+    'ask.download'        = @("Download version {0} (approx. 900 MB) and verify it?`n`nChecked: signature, archive, and whether both cards are included with the same driver version. Nothing is installed.", "Version {0} herunterladen (ca. 900 MB) und prüfen?`n`nGeprüft werden Signatur, Archiv und ob beide Karten mit derselben Treiberversion enthalten sind. Installiert wird dabei nichts.")
+    'ask.download.warn'   = @("Warning: NVIDIA doesn't list {0} for both cards. Only the verification shows whether the package still contains both.`n`n", "Achtung: {0} ist bei NVIDIA nicht für beide Karten gelistet. Ob das Paket trotzdem beide Karten enthält, zeigt erst die Prüfung.`n`n")
+    'msg.verifyfail'      = @("Verification failed, nothing was stored:`n`n{0}", "Prüfung nicht bestanden, nichts wurde abgelegt:`n`n{0}")
+    'msg.verified'        = @('Verified and stored. You can switch to this version now.', 'Geprüft und abgelegt. Die Version kann jetzt gewechselt werden.')
+    'msg.notlocal'        = @("{0} hasn't been downloaded yet. Use 'Download and verify' first.", "{0} ist noch nicht geladen. Bitte zuerst 'Laden und prüfen'.")
+    'msg.active'          = @('{0} is already active.', '{0} ist bereits aktiv.')
+    'ask.switchnow'       = @("Switch to {0} now?`n`nThis takes a few minutes. Displays on the eGPU may go black briefly.", "Jetzt auf {0} wechseln?`n`nDauer: einige Minuten. Bildschirme an der eGPU können dabei kurz schwarz werden.")
+    'msg.badtime'         = @('Enter the time as {0}, e.g. {1}.', 'Bitte den Zeitpunkt im Format {0} eingeben, z. B. {1}.')
+    'msg.pasttime'        = @('That time is in the past.', 'Der Zeitpunkt liegt in der Vergangenheit.')
+    'ask.secureschedule'  = @("The switch will run later as SYSTEM. For that, only administrators may change the files in {0}.`n`nSecure the folder now?", "Der Wechsel läuft später als SYSTEM. Dafür darf außer Administratoren niemand die Dateien in {0} ändern.`n`nOrdnerrechte jetzt absichern?")
+    'msg.securefail'      = @("Securing failed:`n`n{0}", "Absichern fehlgeschlagen:`n`n{0}")
+    'msg.schedulefail'    = @("Scheduling failed:`n`n{0}", "Planen fehlgeschlagen:`n`n{0}")
+    'ask.rebootscheduled' = @("Switch to {0} is scheduled for the next restart.`n`nRestart now?", "Wechsel auf {0} ist für den nächsten Neustart geplant.`n`nJetzt neu starten?")
+    'msg.scheduledat'     = @("Switch to {0} scheduled: {1}.`n`nThe laptop has to be on at that time. If it's off, the switch runs at the next start.", "Wechsel auf {0} geplant: {1}.`n`nDer Laptop muss dann eingeschaltet sein. Ist er aus, wird der Wechsel beim nächsten Start nachgeholt.")
+    'ask.repair'          = @('Remove all mismatching NVIDIA drivers and restore the shared version {0}?', 'Alle abweichenden NVIDIA-Treiber entfernen und die gemeinsame Version {0} wiederherstellen?')
+    'ask.secure'          = @('Restrict write access to {0} to administrators and SYSTEM? Everyone else can only read and run.', 'Schreibrechte für {0} auf Administratoren und SYSTEM beschränken? Alle anderen dürfen nur noch lesen und ausführen.')
+    'msg.secured'         = @('Folder permissions secured.', 'Ordnerrechte abgesichert.')
+    'msg.failed'          = @("Failed:`n`n{0}", "Fehlgeschlagen:`n`n{0}")
+    'msg.busy'            = @("An operation is still running. Wait until it's finished.", 'Es läuft noch ein Vorgang. Bitte warten, bis er abgeschlossen ist.')
+    'msg.shortcut'        = @('Desktop shortcut "eGPU Manager" created.', 'Desktop-Verknüpfung "eGPU Manager" angelegt.')
+    'ask.install'         = @("Install the tool to {0}?`n`n- create the folder and protect it against changes by standard users`n- create the desktop shortcut 'eGPU Manager'`n- restart from there", "Werkzeug nach {0} installieren?`n`n- Ordner anlegen und gegen Änderungen durch normale Benutzer absichern`n- Desktop-Verknüpfung 'eGPU Manager' anlegen`n- danach von dort neu starten")
+    'ask.install.existing'= @("`n`nThere's already an installation there. Settings and driver packages are kept; only the script is replaced.", "`n`nDort gibt es bereits eine Installation. Einstellungen und Treiberpakete bleiben erhalten, nur das Script wird ersetzt.")
+    'msg.installfail'     = @("Installation failed:`n`n{0}", "Installation fehlgeschlagen:`n`n{0}")
+    'ask.update'          = @("Update eGPU Manager from {0} to {1}?`n`nThe new version is downloaded from GitHub and checked, then the tool restarts. Settings and driver packages are kept.", "eGPU Manager von {0} auf {1} aktualisieren?`n`nDie neue Version wird von GitHub geladen und geprüft, danach startet das Werkzeug neu. Einstellungen und Treiberpakete bleiben erhalten.")
+    'msg.updatefail'      = @("Update failed:`n`n{0}", "Update fehlgeschlagen:`n`n{0}")
+}
+
+# Translate a key; extra arguments are inserted with -f
+function T([string]$Key) {
+    $e = $Global:GTStrings[$Key]
+    if (-not $e) { return $Key }
+    $s = if ($Global:GT.Lang -eq 'de') { $e[1] } else { $e[0] }
+    if ($args.Count) { $s -f $args } else { $s }
+}
+
+# =============================================================================================
+#  Basics
 # =============================================================================================
 
 function Write-Log([string]$Msg) {
@@ -65,16 +256,20 @@ function Get-Config {
     Get-Content $GT.ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
-# Grundkonfiguration, falls nur GpuTool.ps1 ohne config.json kopiert wurde
+function Save-Config($Config) {
+    $Config | ConvertTo-Json -Depth 6 | Set-Content -Path $GT.ConfigFile -Encoding UTF8
+}
+
+# Default configuration, used when only GpuTool.ps1 was copied without config.json
 function New-DefaultConfig {
     [pscustomobject]@{
         Current      = ''
         KeepVersions = 2
         DownloadFrom = '4070'
-        Settings     = [pscustomobject]@{ Theme = 'Auto' }
+        Settings     = [pscustomobject]@{ Theme = 'Auto'; Language = 'Auto' }
         Devices      = @(
-            [pscustomobject]@{ Short = 'A2000'; Name = 'RTX A2000 (intern)'; HardwareId = 'PCI\VEN_10DE&DEV_25BA&SUBSYS_0B1A1028'; Psid = 124; Pfid = 989 },
-            [pscustomobject]@{ Short = '4070';  Name = 'RTX 4070 (eGPU)';    HardwareId = 'PCI\VEN_10DE&DEV_2786&SUBSYS_51371462'; Psid = 127; Pfid = 1015 }
+            [pscustomobject]@{ Short = 'A2000'; Name = 'RTX A2000 (internal)'; HardwareId = 'PCI\VEN_10DE&DEV_25BA&SUBSYS_0B1A1028'; Psid = 124; Pfid = 989 },
+            [pscustomobject]@{ Short = '4070';  Name = 'RTX 4070 (eGPU)';      HardwareId = 'PCI\VEN_10DE&DEV_2786&SUBSYS_51371462'; Psid = 127; Pfid = 1015 }
         )
         Packages     = @()
     }
@@ -93,11 +288,24 @@ function Set-Setting([string]$Name, $Value) {
     Save-Config $cfg
 }
 
-function Save-Config($Config) {
-    $Config | ConvertTo-Json -Depth 6 | Set-Content -Path $GT.ConfigFile -Encoding UTF8
+# Language: setting Auto -> German if Windows display language is German, otherwise English
+function Resolve-Language([string]$Setting) {
+    if ($Setting -in 'en', 'de') { return $Setting }
+    if ([Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq 'de') { 'de' } else { 'en' }
 }
 
-# 32.0.15.9636 -> 596.36 (NVIDIA-Schema: letzte Ziffer des 3. Felds + 4. Feld)
+# 1.0 stored packages in "Pakete" - move them to "Packages"
+function Move-LegacyPackages {
+    $old = Join-Path $GT.Root 'Pakete'
+    if (-not (Test-Path $old) -or (Test-Path $GT.PkgDir)) { return }
+    try { Rename-Item $old 'Packages' -ErrorAction Stop } catch { return }
+    $cfg = Get-Config
+    foreach ($p in @($cfg.Packages)) { $p.File = $p.File -replace '^Pakete\\', 'Packages\' }
+    Save-Config $cfg
+    Write-Log (T 'log.migrated')
+}
+
+# 32.0.15.9636 -> 596.36 (NVIDIA scheme: last digit of the 3rd field + 4th field)
 function ConvertTo-NvVersion([string]$DriverVersion) {
     $p = "$DriverVersion".Split('.')
     if ($p.Count -ne 4) { return $null }
@@ -106,7 +314,7 @@ function ConvertTo-NvVersion([string]$DriverVersion) {
 }
 
 # =============================================================================================
-#  Zustand
+#  Status
 # =============================================================================================
 
 function Get-GpuState {
@@ -126,7 +334,7 @@ function Get-GpuState {
     }
 }
 
-# NVIDIA-Anzeigetreiber im Windows-Treiberspeicher (pnputil XML: schnell, sprachunabhängig, ohne Adminrechte)
+# NVIDIA display drivers in the Windows driver store (pnputil XML: fast, language-independent, no admin needed)
 function Get-StorePackages {
     [xml]$x = (& pnputil.exe /enum-drivers /class Display /format xml) -join "`n"
     foreach ($d in $x.PnpUtil.Driver) {
@@ -154,7 +362,7 @@ function Get-Summary {
 }
 
 # =============================================================================================
-#  Versionen bei NVIDIA
+#  NVIDIA versions
 # =============================================================================================
 
 function Get-OnlineList([int]$Psid, [int]$Pfid) {
@@ -169,7 +377,7 @@ function Get-OnlineList([int]$Psid, [int]$Pfid) {
     }
 }
 
-# Eine Zeile pro Version: für welche Karte gelistet, gemeinsam, lokal abgelegt
+# One row per version: listed for which card, shared, stored locally
 function Get-VersionTable {
     $cfg  = Get-Config
     $rows = @{}
@@ -201,7 +409,7 @@ function Get-VersionTable {
 }
 
 # =============================================================================================
-#  Pakete laden, prüfen, ablegen
+#  Download, verify, store packages
 # =============================================================================================
 
 function Save-Download([string]$Url, [string]$Path) {
@@ -216,31 +424,31 @@ function Save-Download([string]$Url, [string]$Path) {
         while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
             $out.Write($buf, 0, $n); $done += $n
             $pct = [int](100 * $done / [Math]::Max(1, $total))
-            if ($pct -ne $last) { Set-Progress $pct ('Download {0:N0} von {1:N0} MB' -f ($done / 1MB), ($total / 1MB)); $last = $pct }
+            if ($pct -ne $last) { Set-Progress $pct (T 'prog.download' ($done / 1MB) ($total / 1MB)); $last = $pct }
         }
     } finally { $out.Close(); $in.Close(); $resp.Close() }
-    if ($done -ne $total) { throw "Download unvollständig ($done von $total Bytes)" }
-    Write-Log ('  Download vollständig ({0:N0} Bytes)' -f $done)
+    if ($done -ne $total) { throw (T 'err.incomplete' $done $total) }
+    Write-Log (T 'log.downloaded' $done)
 }
 
-# Prüft ein NVIDIA-Paket: Signatur, Archiv, beide Karten enthalten, gleiche Treiberversion, Katalog signiert
+# Verifies an NVIDIA package: signature, archive, both cards included, same driver version, signed catalog
 function Test-Package([string]$Exe) {
     $cfg = Get-Config
-    if (-not (Test-Path $GT.SevenZip)) { throw "7-Zip nicht gefunden ($($GT.SevenZip))" }
+    if (-not (Test-Path $GT.SevenZip)) { throw (T 'err.7zip' $GT.SevenZip) }
 
-    Set-Progress -1 'Prüfe Signatur ...'
+    Set-Progress -1 (T 'prog.sig')
     $sig = Get-AuthenticodeSignature $Exe
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=NVIDIA Corporation') {
-        throw "Signatur ungültig ($($sig.Status), $($sig.SignerCertificate.Subject))"
+        throw (T 'err.sig' $sig.Status $sig.SignerCertificate.Subject)
     }
-    Write-Log '  Signatur gültig (NVIDIA Corporation)'
+    Write-Log (T 'log.sigok')
 
-    Set-Progress -1 'Teste Archiv ...'
+    Set-Progress -1 (T 'prog.archive')
     & $GT.SevenZip t $Exe | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Archivtest fehlgeschlagen' }
-    Write-Log '  Archivtest fehlerfrei'
+    if ($LASTEXITCODE -ne 0) { throw (T 'err.archive') }
+    Write-Log (T 'log.archiveok')
 
-    Set-Progress -1 'Prüfe Treiberdateien ...'
+    Set-Progress -1 (T 'prog.infs')
     $tmp = Join-Path $GT.WorkDir ('check-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     & $GT.SevenZip e $Exe "-o$tmp" 'Display.Driver\*.inf' 'Display.Driver\NV_DISP.CAT' -y | Out-Null
     try {
@@ -248,23 +456,23 @@ function Test-Package([string]$Exe) {
         foreach ($d in $cfg.Devices) {
             $pattern = [regex]::Escape($d.HardwareId) + '\s*$'
             $hit = Get-ChildItem $tmp -Filter '*.inf' | Where-Object { (Get-Content $_.FullName) -match $pattern } | Select-Object -First 1
-            if (-not $hit) { throw "$($d.Name) ist in diesem Paket nicht enthalten" }
+            if (-not $hit) { throw (T 'err.notinpkg' $d.Name) }
             $dv = ((@((Get-Content $hit.FullName) -match '^\s*DriverVer'))[0] -replace '.*,\s*', '').Trim()
-            Write-Log "  $($d.Name): $($hit.Name), Treiberversion $dv"
+            Write-Log (T 'log.devinf' $d.Name $hit.Name $dv)
             $infs += $hit.Name; $vers += $dv
         }
-        if (@($vers | Select-Object -Unique).Count -ne 1) { throw "Unterschiedliche Treiberversionen im Paket: $($vers -join ', ')" }
+        if (@($vers | Select-Object -Unique).Count -ne 1) { throw (T 'err.vermix' ($vers -join ', ')) }
         $cat = Get-AuthenticodeSignature (Join-Path $tmp 'NV_DISP.CAT')
-        if ($cat.Status -ne 'Valid') { throw "Treiberkatalog nicht gültig signiert ($($cat.Status))" }
-        Write-Log '  Treiberkatalog gültig signiert'
+        if ($cat.Status -ne 'Valid') { throw (T 'err.catalog' $cat.Status) }
+        Write-Log (T 'log.catok')
     } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
 
     [pscustomobject]@{ DriverVersion = $vers[0]; Infs = @($infs | Select-Object -Unique) }
 }
 
 function Import-Version([string]$Version, [string]$Url) {
-    if (-not $Url) { throw "Keine Download-Adresse für $Version" }
-    Write-Log "Lade und prüfe $Version"
+    if (-not $Url) { throw (T 'err.nourl' $Version) }
+    Write-Log (T 'log.import' $Version)
     $name = [IO.Path]::GetFileName(([uri]$Url).AbsolutePath)
     $tmp  = Join-Path $GT.WorkDir "download-$Version"
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -281,7 +489,7 @@ function Import-Version([string]$Version, [string]$Url) {
         $cfg = Get-Config
         $pkg = [pscustomobject]@{
             Version       = $Version
-            File          = "Pakete\$Version\$name"
+            File          = "Packages\$Version\$name"
             Sha256        = (Get-FileHash (Join-Path $dir $name)).Hash
             DriverVersion = $info.DriverVersion
             Infs          = $info.Infs
@@ -290,13 +498,13 @@ function Import-Version([string]$Version, [string]$Url) {
         }
         $cfg.Packages = @(@($cfg.Packages | Where-Object { $_.Version -ne $Version }) + $pkg)
         Save-Config $cfg
-        Write-Log "Geprüft und abgelegt: $Version ($($info.DriverVersion)) - beide Karten enthalten"
+        Write-Log (T 'log.imported' $Version $info.DriverVersion)
     } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
     Remove-OldPackages -Keep $Version
     $true
 }
 
-# Behält die installierte Version und insgesamt höchstens KeepVersions Pakete
+# Keeps the installed version and at most KeepVersions packages in total
 function Remove-OldPackages([string]$Keep) {
     $cfg     = Get-Config
     $keepSet = @(@($cfg.Current, $Keep) | Where-Object { $_ } | Select-Object -Unique)
@@ -305,59 +513,59 @@ function Remove-OldPackages([string]$Keep) {
     $remove  = @($others | Select-Object -Skip $slots)
     if (-not $remove) { return }
     foreach ($p in $remove) {
-        Remove-Item (Join-Path $GT.PkgDir $p.Version) -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Log "Altes Paket entfernt: $($p.Version)"
+        Remove-Item (Split-Path (Join-Path $GT.Root $p.File)) -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log (T 'log.removedpkg' $p.Version)
     }
     $cfg.Packages = @(@($cfg.Packages) | Where-Object { $_.Version -notin @($remove | ForEach-Object Version) })
     Save-Config $cfg
 }
 
 # =============================================================================================
-#  Wechseln
+#  Switch
 # =============================================================================================
 
 function Install-Version([string]$Version) {
-    if (-not (Test-Admin)) { throw 'Für den Treiberwechsel sind Adminrechte nötig' }
+    if (-not (Test-Admin)) { throw (T 'err.admin') }
     $cfg = Get-Config
     $pkg = @($cfg.Packages) | Where-Object Version -eq $Version | Select-Object -First 1
-    if (-not $pkg) { throw "Version $Version ist nicht lokal abgelegt - zuerst laden und prüfen" }
+    if (-not $pkg) { throw (T 'err.notlocal' $Version) }
     $exe = Join-Path $GT.Root $pkg.File
-    Write-Log "Wechsel auf $Version ($($pkg.DriverVersion))"
+    Write-Log (T 'log.switch' $Version $pkg.DriverVersion)
 
-    # Paket unverändert und echt?
-    Set-Progress -1 'Prüfe Paket ...'
-    if (-not (Test-Path $exe)) { throw "Paketdatei fehlt: $exe" }
-    if ((Get-FileHash $exe).Hash -ne $pkg.Sha256) { throw 'Prüfsumme stimmt nicht - Paket wurde verändert' }
+    # package unchanged and genuine?
+    Set-Progress -1 (T 'prog.pkg')
+    if (-not (Test-Path $exe)) { throw (T 'err.pkgmissing' $exe) }
+    if ((Get-FileHash $exe).Hash -ne $pkg.Sha256) { throw (T 'err.hash') }
     $sig = Get-AuthenticodeSignature $exe
-    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=NVIDIA Corporation') { throw 'Signatur ungültig' }
-    Write-Log '  Paket unverändert, Signatur gültig'
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=NVIDIA Corporation') { throw (T 'err.sigshort') }
+    Write-Log (T 'log.pkgok')
 
-    # Treiberteil entpacken
-    Set-Progress -1 'Entpacke Treiber ...'
+    # extract the driver part
+    Set-Progress -1 (T 'prog.extract')
     $x = Join-Path $GT.WorkDir "install-$Version"
     Remove-Item $x -Recurse -Force -ErrorAction SilentlyContinue
     & $GT.SevenZip x $exe "-o$x" 'Display.Driver\*' -y | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'Entpacken fehlgeschlagen' }
+    if ($LASTEXITCODE -ne 0) { throw (T 'err.extract') }
     $dd = Join-Path $x 'Display.Driver'
 
     $reboot = $false
     try {
-        foreach ($inf in @($pkg.Infs)) { if (-not (Test-Path (Join-Path $dd $inf))) { throw "$inf fehlt im Paket" } }
+        foreach ($inf in @($pkg.Infs)) { if (-not (Test-Path (Join-Path $dd $inf))) { throw (T 'err.infmissing' $inf) } }
 
-        # 1. alle anderen NVIDIA-Anzeigetreiber entfernen
+        # 1. remove all other NVIDIA display drivers
         foreach ($s in @(Get-StorePackages | Where-Object { $_.DriverVersion -ne $pkg.DriverVersion })) {
-            Set-Progress -1 "Entferne $($s.NvVersion) ..."
+            Set-Progress -1 (T 'prog.remove' $s.NvVersion)
             $out = & pnputil.exe /delete-driver $s.Driver /uninstall /force 2>&1
-            Write-Log ('  entfernt {0} ({1}, {2}) -> Exit {3}' -f $s.Driver, $s.Original, $s.NvVersion, $LASTEXITCODE)
+            Write-Log (T 'log.removed' $s.Driver $s.Original $s.NvVersion $LASTEXITCODE)
             if ($LASTEXITCODE -eq 3010) { $reboot = $true } elseif ($LASTEXITCODE -ne 0) { Write-Log "    $($out -join ' ')" }
         }
-        # 2. gemeinsame Version installieren
+        # 2. install the shared version
         foreach ($inf in @($pkg.Infs)) {
-            Set-Progress -1 "Installiere $inf ..."
+            Set-Progress -1 (T 'prog.install' $inf)
             $out = & pnputil.exe /add-driver (Join-Path $dd $inf) /install 2>&1
-            Write-Log ('  installiert {0} -> Exit {1}' -f $inf, $LASTEXITCODE)
+            Write-Log (T 'log.installed' $inf $LASTEXITCODE)
             if ($LASTEXITCODE -eq 3010) { $reboot = $true }
-            elseif ($LASTEXITCODE -notin 0, 259) { Write-Log "    $($out -join ' ')" }   # 259 = kein Gerät aktualisiert
+            elseif ($LASTEXITCODE -notin 0, 259) { Write-Log "    $($out -join ' ')" }   # 259 = no device updated
         }
     } finally { Remove-Item $x -Recurse -Force -ErrorAction SilentlyContinue }
 
@@ -369,27 +577,26 @@ function Install-Version([string]$Version) {
     Start-Sleep -Seconds 5
     $s = Get-Summary
     foreach ($g in $s.Gpus) {
-        Write-Log ('  {0}: {1}' -f $g.Name, $(if ($g.Present) { "$($g.NvVersion), Code $($g.Problem)" } else { 'nicht angeschlossen' }))
+        Write-Log ('  {0}: {1}' -f $g.Name, $(if ($g.Present) { T 'gpu.code' $g.NvVersion $g.Problem } else { T 'gpu.absent' }))
     }
-    $ok = $s.Ok -and -not $reboot
-    $msg = if ($ok) { "Beide Karten nutzen jetzt die gemeinsame Version $Version." }
-           else { "Treiber $Version ist installiert. Bitte den Laptop neu starten, um den Wechsel abzuschließen." }
+    $ok  = $s.Ok -and -not $reboot
+    $msg = if ($ok) { T 'msg.switchok' $Version } else { T 'msg.switchreboot' $Version }
     Write-Log $msg
     [pscustomobject]@{ Ok = $ok; RebootRequired = (-not $ok); Message = $msg }
 }
 
 # =============================================================================================
-#  Geplanter Wechsel (einmalige Aufgabe, löscht sich nach dem Lauf selbst)
+#  Scheduled switch (one-time task that deletes itself after running)
 # =============================================================================================
 
-# Darf außer Administratoren und SYSTEM niemand in den Ordner schreiben? (Die Aufgabe läuft als SYSTEM.)
+# Is write access limited to administrators and SYSTEM? (The task runs as SYSTEM.)
 function Test-FolderSecure {
-    $risky = 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4'   # Jeder, Authentifizierte Benutzer, Benutzer, Interaktiv
+    $risky = 'S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4'   # Everyone, Authenticated Users, Users, Interactive
     $write = [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
     foreach ($a in (Get-Acl $GT.Root).Access) {
         if ($a.AccessControlType -ne 'Allow') { continue }
         try { $sid = $a.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { continue }
-        $rights = [int64]$a.FileSystemRights
+        $rights  = [int64]$a.FileSystemRights
         $generic = $rights -band 0x50000000   # GENERIC_WRITE / GENERIC_ALL
         if ($sid -in $risky -and (($rights -band [int64]$write) -or $generic)) { return $false }
     }
@@ -398,71 +605,22 @@ function Test-FolderSecure {
 
 function Protect-Folder([string]$Path = $GT.Root) {
     $out = & icacls.exe $Path /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 2>&1
-    Write-Log "Ordnerrechte abgesichert ($Path) -> Exit $LASTEXITCODE"
+    Write-Log (T 'log.secured' $Path $LASTEXITCODE)
     if ($LASTEXITCODE -ne 0) { throw ($out -join ' ') }
 }
 
-# =============================================================================================
-#  Installation
-# =============================================================================================
-
-function Test-Installed {
-    $a = [IO.Path]::GetFullPath($GT.Root).TrimEnd('\')
-    $b = [IO.Path]::GetFullPath($GT.InstallDir).TrimEnd('\')
-    $a -eq $b
-}
-
-function New-DesktopShortcut([string]$Script) {
-    $lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'GPU-Verwaltung.lnk'
-    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
-    $s.TargetPath       = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $s.Arguments        = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Script`""
-    $s.WorkingDirectory = Split-Path $Script
-    $s.IconLocation     = "$env:SystemRoot\System32\dxdiag.exe,0"
-    $s.WindowStyle      = 7
-    $s.Description      = 'Gemeinsame NVIDIA-Treiberversion für RTX A2000 und RTX 4070 verwalten'
-    $s.Save()
-    Write-Log "Desktop-Verknüpfung angelegt: $lnk"
-}
-
-# Kopiert das Werkzeug nach C:\Scripts\GpuTool, sichert den Ordner ab und legt die Verknüpfung an.
-# Eine vorhandene Installation behält ihre Einstellungen und Pakete, nur das Script wird ersetzt.
-# Gibt den Pfad des installierten Scripts zurück.
-function Install-Tool {
-    $dst    = $GT.InstallDir
-    $target = Join-Path $dst 'GpuTool.ps1'
-    New-Item -ItemType Directory -Force -Path $dst | Out-Null
-    if (-not (Test-Installed)) {
-        Write-Log "Installiere nach $dst"
-        Copy-Item $GT.Self $target -Force
-        if (Test-Path (Join-Path $dst 'config.json')) {
-            Write-Log '  vorhandene Installation gefunden - Einstellungen und Pakete bleiben erhalten'
-        } else {
-            if (Test-Path $GT.ConfigFile) { Copy-Item $GT.ConfigFile $dst -Force }
-            if (Test-Path $GT.PkgDir) {
-                Set-Progress -1 'Kopiere Treiberpakete ...'
-                Copy-Item $GT.PkgDir $dst -Recurse -Force
-                Write-Log '  Treiberpakete übernommen'
-            }
-        }
-    }
-    Protect-Folder $dst
-    New-DesktopShortcut $target
-    $target
-}
-
 function Register-Switch([string]$Version, $At) {
-    if (-not (Test-FolderSecure)) { throw "Ordner $($GT.Root) ist nicht abgesichert - zuerst 'Rechte absichern'" }
+    if (-not (Test-FolderSecure)) { throw (T 'err.notsecure' $GT.Root) }
     $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($GT.Self)`" -Apply $Version -FromTask"
     $act = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arg
     if ($At) { $trg = New-ScheduledTaskTrigger -Once -At $At }
     else     { $trg = New-ScheduledTaskTrigger -AtStartup; $trg.Delay = 'PT1M' }
     $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
     $prn = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $when = if ($At) { ([datetime]$At).ToString('dd.MM.yyyy HH:mm') } else { 'beim nächsten Neustart' }
+    $when = if ($At) { ([datetime]$At).ToString((T 'fmt.datetime')) } else { T 'when.reboot' }
     Register-ScheduledTask -TaskName $GT.TaskName -Action $act -Trigger $trg -Settings $set -Principal $prn -Force `
-        -Description "GPU-Verwaltung: einmaliger Wechsel auf NVIDIA $Version ($when). Löscht sich nach dem Lauf selbst." | Out-Null
-    Write-Log "Wechsel auf $Version geplant: $when"
+        -Description (T 'task.desc' $Version $when) | Out-Null
+    Write-Log (T 'log.scheduled' $Version $when)
 }
 
 function Get-PendingSwitch {
@@ -470,14 +628,14 @@ function Get-PendingSwitch {
     if (-not $t) { return $null }
     $ver  = if ($t.Actions[0].Arguments -match '-Apply\s+(\S+)') { $Matches[1] } else { '?' }
     $trg  = $t.Triggers[0]
-    $when = if ($trg.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger') { 'beim nächsten Neustart' }
-            else { ([datetime]$trg.StartBoundary).ToString('dd.MM.yyyy HH:mm') }
+    $when = if ($trg.CimClass.CimClassName -eq 'MSFT_TaskBootTrigger') { T 'when.reboot' }
+            else { ([datetime]$trg.StartBoundary).ToString((T 'fmt.datetime')) }
     [pscustomobject]@{ Version = $ver; When = $when }
 }
 
 function Unregister-Switch {
     Unregister-ScheduledTask -TaskName $GT.TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Write-Log 'Geplanter Wechsel abgebrochen'
+    Write-Log (T 'log.unscheduled')
 }
 
 function Get-LastResult {
@@ -489,38 +647,135 @@ function Set-LastResultShown {
     if ($r) { $r.Shown = $true; $r | ConvertTo-Json | Set-Content $GT.ResultFile -Encoding UTF8 }
 }
 
-# Wartet (als SYSTEM) bis jemand angemeldet ist und zeigt dann eine Meldung
+# Waits (as SYSTEM) until someone is signed in, then shows a message
 function Send-UserMessage([string]$Text, [int]$WaitMinutes) {
     $deadline = (Get-Date).AddMinutes($WaitMinutes)
     while (-not (Get-Process explorer -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 15 }
     if (Get-Process explorer -ErrorAction SilentlyContinue) {
         Start-Sleep -Seconds 20
-        & msg.exe * /TIME:0 "GPU-Verwaltung`n`n$Text" 2>$null
+        & msg.exe * /TIME:0 "$($GT.AppName)`n`n$Text" 2>$null
     }
 }
 
 # =============================================================================================
-#  Konsole
+#  Install and update
+# =============================================================================================
+
+function Test-Installed {
+    $a = [IO.Path]::GetFullPath($GT.Root).TrimEnd('\')
+    $b = [IO.Path]::GetFullPath($GT.InstallDir).TrimEnd('\')
+    $a -eq $b
+}
+
+# A git checkout is updated with git, not with the built-in updater
+function Test-DevCopy { Test-Path (Join-Path $GT.Root '.git') }
+
+function New-DesktopShortcut([string]$Script) {
+    $desk = [Environment]::GetFolderPath('Desktop')
+    Remove-Item (Join-Path $desk 'GPU-Verwaltung.lnk') -ErrorAction SilentlyContinue   # name used by 1.0
+    $lnk = Join-Path $desk 'eGPU Manager.lnk'
+    $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+    $s.TargetPath       = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $s.Arguments        = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Script`""
+    $s.WorkingDirectory = Split-Path $Script
+    $s.IconLocation     = "$env:SystemRoot\System32\dxdiag.exe,0"
+    $s.WindowStyle      = 7
+    $s.Description      = T 'lnk.desc'
+    $s.Save()
+    Write-Log (T 'log.shortcut' $lnk)
+}
+
+# Copies the tool to C:\Scripts\GpuTool, secures the folder and creates the shortcut.
+# An existing installation keeps its settings and packages; only the script is replaced.
+# Returns the path of the installed script.
+function Install-Tool {
+    $dst    = $GT.InstallDir
+    $target = Join-Path $dst 'GpuTool.ps1'
+    New-Item -ItemType Directory -Force -Path $dst | Out-Null
+    if (-not (Test-Installed)) {
+        Write-Log (T 'log.install' $dst)
+        Copy-Item $GT.Self $target -Force
+        if (Test-Path (Join-Path $dst 'config.json')) {
+            Write-Log (T 'log.existing')
+        } else {
+            if (Test-Path $GT.ConfigFile) { Copy-Item $GT.ConfigFile $dst -Force }
+            if (Test-Path $GT.PkgDir) {
+                Set-Progress -1 (T 'prog.copypkg')
+                Copy-Item $GT.PkgDir $dst -Recurse -Force
+                Write-Log (T 'log.copiedpkg')
+            }
+        }
+    }
+    Protect-Folder $dst
+    New-DesktopShortcut $target
+    $target
+}
+
+# Newest release = highest version tag (vX.Y.Z) in the GitHub repository
+function Get-LatestRelease {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $tags = Invoke-RestMethod -UseBasicParsing -TimeoutSec 15 -Headers @{ 'User-Agent' = 'eGPU-Manager' } `
+        -Uri "https://api.github.com/repos/$($GT.Repo)/tags?per_page=100"
+    $best = $null
+    foreach ($t in @($tags)) {
+        if ($t.name -match '^v?(\d+\.\d+\.\d+)$') {
+            $v = [version]$Matches[1]
+            if (-not $best -or $v -gt $best.Version) { $best = [pscustomobject]@{ Version = $v; Tag = $t.name } }
+        }
+    }
+    $best
+}
+
+# Replaces this script with the version from the given tag. Returns the script path for the restart.
+function Update-Script([string]$Tag, [string]$Version) {
+    if (Test-DevCopy) { throw (T 'err.devcopy') }
+    Write-Log (T 'log.update' $GT.Version $Version)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    New-Item -ItemType Directory -Force -Path $GT.WorkDir | Out-Null
+    $tmp = Join-Path $GT.WorkDir "GpuTool-$Version.ps1"
+    Invoke-WebRequest -UseBasicParsing -TimeoutSec 60 -Uri "https://raw.githubusercontent.com/$($GT.Repo)/$Tag/GpuTool.ps1" -OutFile $tmp
+
+    $err = $null
+    [void][Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$null, [ref]$err)
+    if ($err) { throw (T 'err.update.parse') }
+    $bytes = [IO.File]::ReadAllBytes($tmp)
+    $text  = [Text.Encoding]::UTF8.GetString($bytes)
+    if ($text -notmatch ("Version\s*=\s*'" + [regex]::Escape($Version) + "'")) { throw (T 'err.update.version') }
+    # Windows PowerShell 5.1 needs a BOM to read umlauts correctly
+    if (-not ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) {
+        $bytes = [byte[]](0xEF, 0xBB, 0xBF) + $bytes
+    }
+    $backup = "$($GT.Self).bak"
+    Copy-Item $GT.Self $backup -Force
+    [IO.File]::WriteAllBytes($GT.Self, $bytes)
+    Remove-Item $tmp -ErrorAction SilentlyContinue
+    Write-Log (T 'log.updated' $Version $backup)
+    $GT.Self
+}
+
+# =============================================================================================
+#  Console
 # =============================================================================================
 
 function Show-Status {
     $s = Get-Summary
     foreach ($g in $s.Gpus) {
-        Write-Host ('{0,-22} {1}' -f $g.Name, $(if ($g.Present) { "$($g.NvVersion) ($($g.DriverVersion)), Code $($g.Problem)" } else { 'nicht angeschlossen' }))
+        Write-Host ('{0,-22} {1}' -f $g.Name, $(if ($g.Present) { T 'gpu.code' "$($g.NvVersion) ($($g.DriverVersion))" $g.Problem } else { T 'gpu.absent' }))
     }
-    foreach ($p in $s.Store) { Write-Host ('Treiberspeicher        {0} {1} {2}' -f $p.Driver, $p.Original, $p.NvVersion) }
-    if ($s.Ok) { Write-Host "OK: gemeinsame Version $($s.Common)" -ForegroundColor Green }
-    else       { Write-Host "ABWEICHUNG: $($s.Versions -join ', ')" -ForegroundColor Yellow }
+    foreach ($p in $s.Store) { Write-Host ('{0,-22} {1} {2} {3}' -f (T 'con.store'), $p.Driver, $p.Original, $p.NvVersion) }
+    if ($s.Ok) { Write-Host (T 'con.ok' $s.Common) -ForegroundColor Green }
+    else       { Write-Host (T 'con.mismatch' ($s.Versions -join ', ')) -ForegroundColor Yellow }
     $p = Get-PendingSwitch
-    if ($p) { Write-Host "Geplant: Wechsel auf $($p.Version) $($p.When)" }
+    if ($p) { Write-Host (T 'con.pending' $p.Version $p.When) }
 }
 
 function Invoke-Apply {
-    if (-not (Test-Admin)) { Write-Log 'Abbruch: -Apply braucht Adminrechte'; exit 1 }
+    if (-not (Test-Admin)) { Write-Log (T 'err.applyadmin'); exit 1 }
+    Move-LegacyPackages
     try { $r = Install-Version $Apply }
     catch {
-        Write-Log "FEHLER: $($_.Exception.Message)"
-        $r = [pscustomobject]@{ Ok = $false; RebootRequired = $false; Message = "Wechsel auf $Apply fehlgeschlagen: $($_.Exception.Message)" }
+        Write-Log (T 'log.error' $_.Exception.Message)
+        $r = [pscustomobject]@{ Ok = $false; RebootRequired = $false; Message = (T 'msg.applyfail' $Apply $_.Exception.Message) }
     }
     if ($FromTask) {
         Unregister-ScheduledTask -TaskName $GT.TaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -532,7 +787,7 @@ function Invoke-Apply {
 }
 
 # =============================================================================================
-#  Oberfläche
+#  GUI
 # =============================================================================================
 
 function Show-Gui {
@@ -556,7 +811,7 @@ function Show-Gui {
     $ui.ThemeMode = if ($Theme) { $Theme } else { Get-Setting 'Theme' 'Auto' }   # Auto / Light / Dark
     $cfg = Get-Config
 
-    # ---------- Farben (hell / dunkel) ----------
+    # ---------- colors (light / dark) ----------
     function Get-SystemDark {
         if ($ui.ThemeMode -eq 'Dark')  { return $true }
         if ($ui.ThemeMode -eq 'Light') { return $false }
@@ -570,7 +825,7 @@ function Show-Gui {
             $p = @{
                 Back = (rgb 32 32 32); Surface = (rgb 40 40 40); Fore = (rgb 232 232 232); Muted = (rgb 165 165 160)
                 Button = (rgb 52 52 52); ButtonBorder = (rgb 90 90 90); ButtonHover = (rgb 66 66 66)
-                Header = (rgb 48 48 48); HeaderLine = (rgb 70 70 70); RowMuted = (rgb 135 135 135)
+                Header = (rgb 48 48 48); HeaderLine = (rgb 70 70 70); RowMuted = (rgb 135 135 135); Link = (rgb 133 183 235)
                 Green = (rgb 192 221 151); GreenBg = (rgb 39 80 10)
                 Red   = (rgb 247 193 193); RedBg   = (rgb 121 31 31)
                 Amber = (rgb 250 199 117); AmberBg = (rgb 99 56 6)
@@ -580,7 +835,7 @@ function Show-Gui {
             $p = @{
                 Back = [Drawing.SystemColors]::Control; Surface = [Drawing.Color]::White; Fore = [Drawing.SystemColors]::ControlText; Muted = (rgb 95 94 90)
                 Button = [Drawing.SystemColors]::Control; ButtonBorder = (rgb 173 173 173); ButtonHover = (rgb 229 241 251)
-                Header = [Drawing.Color]::White; HeaderLine = (rgb 229 229 229); RowMuted = [Drawing.Color]::Gray
+                Header = [Drawing.Color]::White; HeaderLine = (rgb 229 229 229); RowMuted = [Drawing.Color]::Gray; Link = (rgb 24 95 165)
                 Green = (rgb 39 80 10);   GreenBg = (rgb 234 243 222)
                 Red   = (rgb 163 45 45);  RedBg   = (rgb 252 235 235)
                 Amber = (rgb 133 79 11);  AmberBg = (rgb 250 238 218)
@@ -593,11 +848,10 @@ function Show-Gui {
     Set-Palette (Get-SystemDark)
     $fontBold = New-Object Drawing.Font('Segoe UI', 9, [Drawing.FontStyle]::Bold)
 
-    function New-Button([string]$Text, [int]$Width = 0) {
+    function New-Button([string]$Text) {
         $b = New-Object Windows.Forms.Button
         $b.Text = $Text; $b.AutoSize = $true; $b.Padding = New-Object Windows.Forms.Padding(6, 2, 6, 2)
         $b.Margin = New-Object Windows.Forms.Padding(0, 3, 8, 3)
-        if ($Width) { $b.MinimumSize = New-Object Drawing.Size($Width, 0) }
         $ui.Buttons += $b
         $b
     }
@@ -606,22 +860,46 @@ function Show-Gui {
         $f.AutoSize = $true; $f.Dock = 'Fill'; $f.WrapContents = $true; $f.Margin = New-Object Windows.Forms.Padding(0)
         $f
     }
+    function New-Label([string]$Text, [int]$Top = 8) {
+        $l = New-Object Windows.Forms.Label
+        $l.Text = $Text; $l.AutoSize = $true; $l.Margin = New-Object Windows.Forms.Padding(0, $Top, 8, 3)
+        $l
+    }
+    # Drop-down list drawn by ourselves - Windows ignores BackColor for DropDownList, so it would stay white in dark mode
+    function New-Combo([string[]]$Items, [int]$Selected, [int]$Width) {
+        $cb = New-Object Windows.Forms.ComboBox
+        $cb.DropDownStyle = 'DropDownList'; $cb.Width = $Width; $cb.Margin = New-Object Windows.Forms.Padding(0, 4, 16, 3)
+        $cb.DrawMode = 'OwnerDrawFixed'
+        $cb.Add_DrawItem({
+            param($s, $e)
+            if ($e.Index -lt 0) { return }
+            $sel = ($e.State -band [Windows.Forms.DrawItemState]::Selected) -ne 0
+            $bg  = if ($sel) { [Drawing.SystemColors]::Highlight } else { $s.BackColor }
+            $fg  = if ($sel) { [Drawing.SystemColors]::HighlightText } else { $s.ForeColor }
+            $br  = New-Object Drawing.SolidBrush($bg); $e.Graphics.FillRectangle($br, $e.Bounds); $br.Dispose()
+            $r   = New-Object Drawing.Rectangle(($e.Bounds.X + 3), $e.Bounds.Y, ($e.Bounds.Width - 3), $e.Bounds.Height)
+            [Windows.Forms.TextRenderer]::DrawText($e.Graphics, [string]$s.Items[$e.Index], $s.Font, $r, $fg,
+                [Windows.Forms.TextFormatFlags]'Left, VerticalCenter, SingleLine')
+        })
+        [void]$cb.Items.AddRange($Items); $cb.SelectedIndex = $Selected
+        $cb
+    }
     function Ask([string]$Text) {
-        [Windows.Forms.MessageBox]::Show($form, $Text, 'GPU-Verwaltung', 'YesNo', 'Question') -eq 'Yes'
+        [Windows.Forms.MessageBox]::Show($form, $Text, $GT.AppName, 'YesNo', 'Question') -eq 'Yes'
     }
     function Show-Msg([string]$Text, [string]$Icon = 'Information') {
-        [void][Windows.Forms.MessageBox]::Show($form, $Text, 'GPU-Verwaltung', 'OK', $Icon)
+        [void][Windows.Forms.MessageBox]::Show($form, $Text, $GT.AppName, 'OK', $Icon)
     }
 
-    # ---------- Fenster ----------
+    # ---------- window ----------
     $form = New-Object Windows.Forms.Form
     $form.SuspendLayout()
     $form.AutoScaleDimensions = New-Object Drawing.SizeF(96, 96)
     $form.AutoScaleMode = 'Dpi'
     $form.Font = New-Object Drawing.Font('Segoe UI', 9)
-    $form.Text = 'GPU-Verwaltung'
-    $form.ClientSize = New-Object Drawing.Size(880, 760)
-    $form.MinimumSize = New-Object Drawing.Size(780, 680)
+    $form.Text = "$($GT.AppName) $($GT.Version)"
+    $form.ClientSize = New-Object Drawing.Size(900, 760)
+    $form.MinimumSize = New-Object Drawing.Size(820, 680)
     $form.StartPosition = 'CenterScreen'
     try { $form.Icon = [Drawing.Icon]::ExtractAssociatedIcon("$env:SystemRoot\System32\dxdiag.exe") } catch { }
 
@@ -637,7 +915,7 @@ function Show-Gui {
     $root.RowCount = 8
     $form.Controls.Add($root)
 
-    # ---------- Karten ----------
+    # ---------- cards ----------
     $cards = New-Object Windows.Forms.TableLayoutPanel
     $cards.Dock = 'Fill'; $cards.AutoSize = $true; $cards.ColumnCount = $cfg.Devices.Count; $cards.Margin = New-Object Windows.Forms.Padding(0)
     $ui.Cards = @{}
@@ -656,28 +934,28 @@ function Show-Gui {
     }
     $root.Controls.Add($cards, 0, 0)
 
-    # ---------- Banner ----------
+    # ---------- banner ----------
     $banner = New-Object Windows.Forms.Label
     $banner.AutoSize = $false; $banner.Dock = 'Fill'; $banner.Height = 46; $banner.Padding = New-Object Windows.Forms.Padding(8, 4, 8, 4)
     $banner.TextAlign = 'MiddleLeft'; $banner.Margin = New-Object Windows.Forms.Padding(0, 0, 8, 8)
-    $banner.BackColor = $C.GrayBg; $banner.ForeColor = $C.Gray; $banner.Text = 'Lade Status ...'; $banner.Tag = 'keep'
+    $banner.BackColor = $C.GrayBg; $banner.ForeColor = $C.Gray; $banner.Text = T 'ui.loading'; $banner.Tag = 'keep'
     $root.Controls.Add($banner, 0, 1)
 
-    # ---------- Versionsliste ----------
+    # ---------- version list ----------
     $gbList = New-Object Windows.Forms.GroupBox
-    $gbList.Text = 'Treiberversionen (NVIDIA)'; $gbList.Dock = 'Fill'; $gbList.Margin = New-Object Windows.Forms.Padding(0, 0, 8, 6)
+    $gbList.Text = T 'ui.versions'; $gbList.Dock = 'Fill'; $gbList.Margin = New-Object Windows.Forms.Padding(0, 0, 8, 6)
     $tlList = New-Object Windows.Forms.TableLayoutPanel
     $tlList.Dock = 'Fill'; $tlList.ColumnCount = 1; $tlList.RowCount = 2
     [void]$tlList.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::Percent, 100)))
     [void]$tlList.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::AutoSize)))
     $lv = New-Object Windows.Forms.ListView
     $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.MultiSelect = $false; $lv.HideSelection = $false
-    [void]$lv.Columns.Add('Version', 80)
-    foreach ($d in $cfg.Devices) { [void]$lv.Columns.Add("für $($d.Short)", 110) }
-    [void]$lv.Columns.Add('Gemeinsam', 95)
-    [void]$lv.Columns.Add('Lokal', 60)
-    [void]$lv.Columns.Add('Status', 300)
-    # Spaltenköpfe im Dunkelmodus selbst zeichnen (Windows zeichnet sie sonst immer hell)
+    [void]$lv.Columns.Add((T 'col.version'), 80)
+    foreach ($d in $cfg.Devices) { [void]$lv.Columns.Add((T 'col.for' $d.Short), 110) }
+    [void]$lv.Columns.Add((T 'col.shared'), 95)
+    [void]$lv.Columns.Add((T 'col.local'), 60)
+    [void]$lv.Columns.Add((T 'col.status'), 300)
+    # draw column headers ourselves in dark mode (Windows always draws them light)
     $lv.OwnerDraw = $true
     $lv.Add_DrawColumnHeader({
         param($s, $e)
@@ -693,8 +971,7 @@ function Show-Gui {
     })
     $lv.Add_DrawItem({ param($s, $e) $e.DrawDefault = $true })
     $lv.Add_DrawSubItem({ param($s, $e) $e.DrawDefault = $true })
-    # letzte Spalte füllt die Breite, damit rechts kein heller Kopfbereich bleibt
-    # Platz für die senkrechte Bildlaufleiste immer freihalten, sonst schaukelt sich die Breite auf
+    # last column fills the width; always leave room for the vertical scrollbar, or the width oscillates
     function Set-LastColumnWidth {
         $w = $lv.Width - 4 - [Windows.Forms.SystemInformation]::VerticalScrollBarWidth
         for ($i = 0; $i -lt $lv.Columns.Count - 1; $i++) { $w -= $lv.Columns[$i].Width }
@@ -705,106 +982,107 @@ function Show-Gui {
     $tlList.Controls.Add($lv, 0, 0)
     $flList = New-Flow
     $chkAll = New-Object Windows.Forms.CheckBox
-    $chkAll.Text = 'Alle Versionen anzeigen'; $chkAll.AutoSize = $true; $chkAll.Margin = New-Object Windows.Forms.Padding(0, 7, 16, 3)
-    $btnRefresh  = New-Button 'Aktualisieren'
-    $btnDownload = New-Button 'Laden und prüfen'
+    $chkAll.Text = T 'ui.showall'; $chkAll.AutoSize = $true; $chkAll.Margin = New-Object Windows.Forms.Padding(0, 7, 16, 3)
+    $btnRefresh  = New-Button (T 'ui.refresh')
+    $btnDownload = New-Button (T 'ui.download')
     $flList.Controls.AddRange(@($chkAll, $btnRefresh, $btnDownload))
     $tlList.Controls.Add($flList, 0, 1)
     $gbList.Controls.Add($tlList)
     $root.Controls.Add($gbList, 0, 2)
 
-    # ---------- Wechseln ----------
+    # ---------- switch ----------
     $gbSwitch = New-Object Windows.Forms.GroupBox
-    $gbSwitch.Text = 'Auf ausgewählte Version wechseln'; $gbSwitch.Dock = 'Fill'; $gbSwitch.AutoSize = $true
+    $gbSwitch.Text = T 'ui.switchgroup'; $gbSwitch.Dock = 'Fill'; $gbSwitch.AutoSize = $true
     $gbSwitch.Margin = New-Object Windows.Forms.Padding(0, 0, 8, 6)
     $tlSwitch = New-Object Windows.Forms.TableLayoutPanel
     $tlSwitch.Dock = 'Fill'; $tlSwitch.AutoSize = $true; $tlSwitch.ColumnCount = 1
     $flWhen = New-Flow
-    $rbNow    = New-Object Windows.Forms.RadioButton; $rbNow.Text = 'Jetzt'; $rbNow.AutoSize = $true; $rbNow.Checked = $true
-    $rbReboot = New-Object Windows.Forms.RadioButton; $rbReboot.Text = 'Beim nächsten Neustart'; $rbReboot.AutoSize = $true
-    $rbAt     = New-Object Windows.Forms.RadioButton; $rbAt.Text = 'Um'; $rbAt.AutoSize = $true
-    foreach ($rb in $rbNow, $rbReboot, $rbAt) { $rb.Margin = New-Object Windows.Forms.Padding(0, 7, 12, 3) }
+    $rbNow    = New-Object Windows.Forms.RadioButton; $rbNow.Text = T 'ui.now'; $rbNow.Checked = $true
+    $rbReboot = New-Object Windows.Forms.RadioButton; $rbReboot.Text = T 'ui.atreboot'
+    $rbAt     = New-Object Windows.Forms.RadioButton; $rbAt.Text = T 'ui.at'
+    foreach ($rb in $rbNow, $rbReboot, $rbAt) { $rb.AutoSize = $true; $rb.Margin = New-Object Windows.Forms.Padding(0, 7, 12, 3) }
     $txtAt = New-Object Windows.Forms.TextBox
     $txtAt.Width = 130; $txtAt.Margin = New-Object Windows.Forms.Padding(0, 5, 16, 3)
     $d0 = (Get-Date).Date.AddHours(22); if ($d0 -lt (Get-Date)) { $d0 = $d0.AddDays(1) }
-    $txtAt.Text = $d0.ToString('dd.MM.yyyy HH:mm')
+    $txtAt.Text = $d0.ToString((T 'fmt.datetime'))
     $txtAt.Add_Enter({ $rbAt.Checked = $true })
-    $btnSwitch = New-Button 'Wechseln'
+    $btnSwitch = New-Button (T 'ui.switch')
     $btnSwitch.Font = $fontBold
     $flWhen.Controls.AddRange(@($rbNow, $rbReboot, $rbAt, $txtAt, $btnSwitch))
     $flPending = New-Flow
-    $lblPending = New-Object Windows.Forms.Label
-    $lblPending.AutoSize = $true; $lblPending.Margin = New-Object Windows.Forms.Padding(0, 8, 12, 3); $lblPending.Text = 'Kein Wechsel geplant.'
-    $lblPending.ForeColor = $C.Gray; $lblPending.Tag = 'keep'
-    $btnCancel = New-Button 'Geplanten Wechsel abbrechen'
+    $lblPending = New-Label (T 'ui.nopending')
+    $lblPending.Margin = New-Object Windows.Forms.Padding(0, 8, 12, 3); $lblPending.ForeColor = $C.Gray; $lblPending.Tag = 'keep'
+    $btnCancel = New-Button (T 'ui.cancelpending')
     $flPending.Controls.AddRange(@($lblPending, $btnCancel))
     $tlSwitch.Controls.Add($flWhen, 0, 0)
     $tlSwitch.Controls.Add($flPending, 0, 1)
     $gbSwitch.Controls.Add($tlSwitch)
     $root.Controls.Add($gbSwitch, 0, 3)
 
-    # ---------- Werkzeuge ----------
+    # ---------- tools ----------
     $flTools = New-Flow
-    $btnRepair = New-Button 'Abweichung reparieren'
-    $btnSecure = New-Button 'Rechte absichern'
-    $btnLog    = New-Button 'Log öffnen'
+    $btnRepair = New-Button (T 'ui.repair')
+    $btnSecure = New-Button (T 'ui.secure')
+    $btnLog    = New-Button (T 'ui.openlog')
     $flTools.Controls.AddRange(@($btnRepair, $btnSecure, $btnLog))
     $root.Controls.Add($flTools, 0, 4)
 
-    # ---------- Fortschritt ----------
+    # ---------- progress ----------
     $flProg = New-Flow
     $flProg.WrapContents = $false
     $progress = New-Object Windows.Forms.ProgressBar
     $progress.Size = New-Object Drawing.Size(260, 16); $progress.MarqueeAnimationSpeed = 30
     $progress.Margin = New-Object Windows.Forms.Padding(0, 6, 8, 6)
-    $lblProgress = New-Object Windows.Forms.Label
-    $lblProgress.AutoSize = $true; $lblProgress.Margin = New-Object Windows.Forms.Padding(0, 6, 0, 0); $lblProgress.ForeColor = $C.Gray
+    $lblProgress = New-Label '' 6
     $flProg.Controls.AddRange(@($progress, $lblProgress))
     $root.Controls.Add($flProg, 0, 5)
 
-    # ---------- Protokoll ----------
+    # ---------- log ----------
     $txtLog = New-Object Windows.Forms.TextBox
     $txtLog.Dock = 'Fill'; $txtLog.Multiline = $true; $txtLog.ReadOnly = $true; $txtLog.ScrollBars = 'Vertical'
-    $txtLog.Font = New-Object Drawing.Font('Consolas', 9); $txtLog.BackColor = [Drawing.Color]::White
+    $txtLog.Font = New-Object Drawing.Font('Consolas', 9)
     $txtLog.Margin = New-Object Windows.Forms.Padding(0, 0, 8, 0)
     $root.Controls.Add($txtLog, 0, 6)
 
-    # ---------- Einstellungen (unten) ----------
+    # ---------- settings bar (bottom) ----------
     $tlSettings = New-Object Windows.Forms.TableLayoutPanel
     $tlSettings.Dock = 'Fill'; $tlSettings.AutoSize = $true; $tlSettings.ColumnCount = 2
     $tlSettings.Margin = New-Object Windows.Forms.Padding(0, 8, 8, 0)
     [void]$tlSettings.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle([Windows.Forms.SizeType]::Percent, 100)))
     [void]$tlSettings.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle([Windows.Forms.SizeType]::AutoSize)))
-    $flTheme = New-Flow
-    $flTheme.WrapContents = $false
-    $lblTheme = New-Object Windows.Forms.Label
-    $lblTheme.Text = 'Darstellung:'; $lblTheme.AutoSize = $true; $lblTheme.Margin = New-Object Windows.Forms.Padding(0, 8, 8, 3)
-    $rbAuto  = New-Object Windows.Forms.RadioButton; $rbAuto.Text  = 'Automatisch'; $rbAuto.Tag  = 'Auto'
-    $rbLight = New-Object Windows.Forms.RadioButton; $rbLight.Text = 'Hell';        $rbLight.Tag = 'Light'
-    $rbDark  = New-Object Windows.Forms.RadioButton; $rbDark.Text  = 'Dunkel';      $rbDark.Tag  = 'Dark'
-    $flTheme.Controls.Add($lblTheme)
-    foreach ($rb in $rbAuto, $rbLight, $rbDark) {
-        $rb.AutoSize = $true; $rb.Margin = New-Object Windows.Forms.Padding(0, 7, 12, 3)
-        $rb.Checked = ($rb.Tag -eq $ui.ThemeMode)
-        $flTheme.Controls.Add($rb)
-    }
-    $flSetBtns = New-Flow
-    $flSetBtns.WrapContents = $false
-    $btnInstall = New-Button $(if (Test-Installed) { 'Verknüpfung erneuern' } else { 'Tool installieren' })
-    $btnToolDir = New-Button 'Tool-Ordner öffnen'
+
+    $themeModes = @('Auto', 'Light', 'Dark')
+    $langModes  = @('Auto', 'en', 'de')
+    $langSet    = Get-Setting 'Language' 'Auto'
+    $flLeft = New-Flow
+    $flLeft.WrapContents = $false
+    $cbTheme = New-Combo @((T 'opt.auto'), (T 'opt.light'), (T 'opt.dark')) ([Math]::Max(0, [array]::IndexOf($themeModes, $ui.ThemeMode))) 110
+    $cbLang  = New-Combo @((T 'opt.auto'), 'English', 'Deutsch') ([Math]::Max(0, [array]::IndexOf($langModes, $langSet))) 110
+    $flLeft.Controls.AddRange(@((New-Label (T 'ui.theme')), $cbTheme, (New-Label (T 'ui.lang')), $cbLang))
+
+    $flRight = New-Flow
+    $flRight.WrapContents = $false
+    $lblVersion = New-Label ("v$($GT.Version)" + $(if (Test-DevCopy) { " ($(T 'ui.dev'))" } else { '' }))
+    $lnkRepo = New-Object Windows.Forms.LinkLabel
+    $lnkRepo.Text = 'GitHub'; $lnkRepo.AutoSize = $true; $lnkRepo.Margin = New-Object Windows.Forms.Padding(0, 8, 12, 3)
+    $btnUpdate  = New-Button ''
+    $btnUpdate.Visible = $false; $btnUpdate.Font = $fontBold
+    $btnInstall = New-Button $(if (Test-Installed) { T 'ui.reinstall' } else { T 'ui.install' })
+    $btnToolDir = New-Button (T 'ui.tooldir')
     $btnToolDir.Margin = New-Object Windows.Forms.Padding(0, 3, 0, 3)
-    $flSetBtns.Controls.AddRange(@($btnInstall, $btnToolDir))
-    $tlSettings.Controls.Add($flTheme, 0, 0)
-    $tlSettings.Controls.Add($flSetBtns, 1, 0)
+    $flRight.Controls.AddRange(@($lblVersion, $lnkRepo, $btnUpdate, $btnInstall, $btnToolDir))
+
+    $tlSettings.Controls.Add($flLeft, 0, 0)
+    $tlSettings.Controls.Add($flRight, 1, 0)
     $root.Controls.Add($tlSettings, 0, 7)
 
     $form.ResumeLayout($false)
     $form.PerformLayout()
 
-    # ---------- Hintergrundarbeit ----------
+    # ---------- background work ----------
     function Set-Busy([bool]$Busy) {
         foreach ($b in $ui.Buttons) { $b.Enabled = -not $Busy }
-        $chkAll.Enabled = -not $Busy
+        $chkAll.Enabled = -not $Busy; $cbLang.Enabled = -not $Busy
         if ($Busy) { $progress.Style = 'Marquee' }
         else { $progress.Style = 'Continuous'; $progress.Value = 0; $lblProgress.Text = '' }
     }
@@ -819,12 +1097,12 @@ function Show-Gui {
         $rs.SessionStateProxy.SetVariable('GtSync', $sync)
         $ps = [powershell]::Create(); $ps.Runspace = $rs
         [void]$ps.AddScript({
-            param($Self, $WorkText, $WorkArgs)
-            . $Self -LoadCore
+            param($Self, $WorkText, $WorkArgs, $Language)
+            . $Self -LoadCore -Lang $Language
             try { $GtSync.Result = & ([scriptblock]::Create($WorkText)) @WorkArgs }
-            catch { $GtSync.Error = $_.Exception.Message; Write-Log "FEHLER: $($_.Exception.Message)" }
+            catch { $GtSync.Error = $_.Exception.Message; Write-Log (T 'log.error' $_.Exception.Message) }
             finally { $GtSync.Done = $true }
-        }).AddArgument($GT.Self).AddArgument($Work.ToString()).AddArgument(@($Arguments))
+        }).AddArgument($GT.Self).AddArgument($Work.ToString()).AddArgument(@($Arguments)).AddArgument($GT.Lang)
         $ui.Job = @{ PS = $ps; RS = $rs; Handle = $ps.BeginInvoke() }
         $ui.OnDone = $OnDone
     }
@@ -833,7 +1111,7 @@ function Show-Gui {
     $timer.Interval = 200
     $ui.Ticks = 0
     $timer.Add_Tick({
-        # Windows-Farbmodus alle 2 Sekunden prüfen
+        # check the Windows color mode every 2 seconds
         $ui.Ticks++
         if (($ui.Ticks % 10) -eq 0) { $dark = Get-SystemDark; if ($dark -ne $ui.Dark) { Set-Theme $dark } }
         $line = $null
@@ -853,8 +1131,8 @@ function Show-Gui {
         }
     })
 
-    # ---------- Anzeige ----------
-    function Format-Date($d) { if ($d) { ([datetime]$d).ToString('dd.MM.yyyy') } else { '–' } }
+    # ---------- display ----------
+    function Format-Date($d) { if ($d) { ([datetime]$d).ToString((T 'fmt.date')) } else { '–' } }
 
     function Update-View {
         $st = $ui.State
@@ -864,32 +1142,37 @@ function Show-Gui {
 
         foreach ($g in $sum.Gpus) {
             $card = $ui.Cards[$g.Short]
-            if (-not $g.Present)      { $t = 'nicht angeschlossen'; $fg = $C.Gray;  $bg = $C.GrayBg }
-            elseif ($g.Problem -eq 0) { $t = 'OK';                  $fg = $C.Green; $bg = $C.GreenBg }
-            elseif ($g.Problem -eq 22){ $t = 'deaktiviert';         $fg = $C.Amber; $bg = $C.AmberBg }
-            else                      { $t = "Fehler Code $($g.Problem)"; $fg = $C.Red; $bg = $C.RedBg }
+            if (-not $g.Present)       { $t = T 'gpu.absent';             $fg = $C.Gray;  $bg = $C.GrayBg }
+            elseif ($g.Problem -eq 0)  { $t = T 'st.ok';                  $fg = $C.Green; $bg = $C.GreenBg }
+            elseif ($g.Problem -eq 22) { $t = T 'st.disabled';            $fg = $C.Amber; $bg = $C.AmberBg }
+            else                       { $t = T 'st.error' $g.Problem;    $fg = $C.Red;   $bg = $C.RedBg }
             $card.Status.Text = $t; $card.Status.ForeColor = $fg; $card.Status.BackColor = $bg
-            $card.Version.Text = if ($g.Present) { "Treiber $($g.NvVersion)  ($($g.DriverVersion))" } else { '' }
+            $card.Version.Text = if ($g.Present) { T 'card.driver' $g.NvVersion $g.DriverVersion } else { '' }
         }
 
-        $storeText = 'Treiberspeicher: ' + ((@($sum.Store) | ForEach-Object { "$($_.Original) $($_.NvVersion)" }) -join ', ')
+        $storeText = T 'ban.store' ((@($sum.Store) | ForEach-Object { "$($_.Original) $($_.NvVersion)" }) -join ', ')
         if ($sum.Ok -and $sum.Common) {
-            $banner.Text = "Beide Karten nutzen die gemeinsame Version $($sum.Common).`r`n$storeText"
+            $banner.Text = (T 'ban.ok' $sum.Common) + "`r`n" + $storeText
             $banner.BackColor = $C.GreenBg; $banner.ForeColor = $C.Green
         } else {
-            $banner.Text = "Treiberversionen weichen ab ($($sum.Versions -join ', ')). 'Abweichung reparieren' stellt $($cfgNow.Current) wieder her.`r`n$storeText"
+            $banner.Text = (T 'ban.mismatch' ($sum.Versions -join ', ') $cfgNow.Current) + "`r`n" + $storeText
             $banner.BackColor = $C.AmberBg; $banner.ForeColor = $C.Amber
         }
-        if ($st.Table.Error) { $banner.Text += "`r`nNVIDIA-Versionsliste nicht erreichbar: $($st.Table.Error)" }
+        if ($st.Table.Error) { $banner.Text += "`r`n" + (T 'ban.offline' $st.Table.Error) }
 
         if ($st.Pending) {
-            $lblPending.Text = "Geplant: Wechsel auf $($st.Pending.Version) $($st.Pending.When)."
+            $lblPending.Text = T 'ui.pending' $st.Pending.Version $st.Pending.When
             $lblPending.ForeColor = $C.Amber; $btnCancel.Visible = $true
         } else {
-            $lblPending.Text = 'Kein Wechsel geplant.'; $lblPending.ForeColor = $C.Gray; $btnCancel.Visible = $false
+            $lblPending.Text = T 'ui.nopending'; $lblPending.ForeColor = $C.Gray; $btnCancel.Visible = $false
         }
         $btnSecure.Visible = -not $st.Secure
         $btnRepair.Visible = -not $sum.Ok
+
+        $latest = $st.Latest
+        if ($latest -and $latest.Version -gt [version]$GT.Version -and -not (Test-DevCopy)) {
+            $btnUpdate.Text = T 'ui.update' $latest.Version; $btnUpdate.Visible = $true
+        } else { $btnUpdate.Visible = $false }
         Update-List
     }
 
@@ -904,14 +1187,14 @@ function Show-Gui {
             if (-not $chkAll.Checked -and -not ($r.Common -or $r.Local -or $isInst)) { continue }
             $it = New-Object Windows.Forms.ListViewItem($r.Version)
             foreach ($d in $cfg.Devices) { [void]$it.SubItems.Add((Format-Date $r.Dates[$d.Short])) }
-            [void]$it.SubItems.Add($(if ($r.Common) { 'ja' } else { 'nein' }))
-            [void]$it.SubItems.Add($(if ($r.Local) { 'ja' } else { '' }))
-            $text = if ($isInst) { 'installiert' }
-                    elseif ($r.Local) { 'geprüft, bereit zum Wechseln' }
-                    elseif ($r.Common) { 'für beide Karten gelistet, nicht geladen' }
+            [void]$it.SubItems.Add($(if ($r.Common) { T 'yes' } else { T 'no' }))
+            [void]$it.SubItems.Add($(if ($r.Local) { T 'yes' } else { '' }))
+            $text = if ($isInst) { T 'ls.installed' }
+                    elseif ($r.Local) { T 'ls.ready' }
+                    elseif ($r.Common) { T 'ls.shared' }
                     else {
                         $missing = @($cfg.Devices | Where-Object { -not $r.Dates.ContainsKey($_.Short) } | ForEach-Object Short)
-                        "nicht für $($missing -join ', ') gelistet"
+                        T 'ls.notfor' ($missing -join ', ')
                     }
             [void]$it.SubItems.Add($text)
             if ($isInst) { $it.Font = $fontBold; $it.ForeColor = $C.Green }
@@ -924,12 +1207,12 @@ function Show-Gui {
         Set-LastColumnWidth
     }
 
-    # ---------- Hell / Dunkel anwenden ----------
+    # ---------- apply light / dark ----------
     function Set-NativeTheme($Ctl) {
         try { [void][GpuTool.Native]::SetWindowTheme($Ctl.Handle, $(if ($ui.Dark) { 'DarkMode_Explorer' } else { 'Explorer' }), $null) } catch { }
     }
     function Set-ControlTheme($Parent) {
-        # Achtung: PowerShell unterscheidet keine Groß-/Kleinschreibung - $ctl, nicht $c (sonst überschreibt es $C)
+        # Careful: PowerShell variables are case-insensitive - use $ctl, not $c (that would overwrite $C)
         foreach ($ctl in $Parent.Controls) {
             if ($ctl.Tag -ne 'keep') {
                 if ($ctl -is [Windows.Forms.Button]) {
@@ -943,8 +1226,16 @@ function Show-Gui {
                         $ctl.ForeColor = [Drawing.SystemColors]::ControlText; $ctl.UseVisualStyleBackColor = $true
                     }
                 }
+                elseif ($ctl -is [Windows.Forms.ComboBox]) {
+                    $ctl.FlatStyle = $(if ($ui.Dark) { 'Flat' } else { 'Standard' })
+                    $ctl.BackColor = $(if ($ui.Dark) { $C.Button } else { [Drawing.SystemColors]::Window })
+                    $ctl.ForeColor = $C.Fore
+                }
                 elseif ($ctl -is [Windows.Forms.ListView] -or $ctl -is [Windows.Forms.TextBox]) {
                     $ctl.BackColor = $C.Surface; $ctl.ForeColor = $C.Fore; Set-NativeTheme $ctl
+                }
+                elseif ($ctl -is [Windows.Forms.LinkLabel]) {
+                    $ctl.BackColor = $C.Back; $ctl.LinkColor = $C.Link; $ctl.ActiveLinkColor = $C.Link; $ctl.VisitedLinkColor = $C.Link
                 }
                 else { $ctl.BackColor = $C.Back; $ctl.ForeColor = $C.Fore }
             }
@@ -955,7 +1246,7 @@ function Show-Gui {
         Set-Palette $Dark
         $form.BackColor = $C.Back; $form.ForeColor = $C.Fore
         Set-ControlTheme $form
-        $lblProgress.ForeColor = $C.Muted
+        $lblProgress.ForeColor = $C.Muted; $lblVersion.ForeColor = $C.Muted
         try { $v = [int]$Dark; [void][GpuTool.Native]::DwmSetWindowAttribute($form.Handle, 20, [ref]$v, 4) } catch { }
         if ($ui.State) { Update-View } else { $banner.BackColor = $C.GrayBg; $banner.ForeColor = $C.Gray; $lblPending.ForeColor = $C.Gray }
         $form.Refresh()
@@ -963,23 +1254,28 @@ function Show-Gui {
 
     function Get-SelectedRow {
         if ($lv.SelectedItems.Count) { return $lv.SelectedItems[0].Tag }
-        Show-Msg 'Bitte zuerst eine Version in der Liste auswählen.'
+        Show-Msg (T 'msg.select')
         $null
     }
 
+    function Restart-Tool([string]$Path = $GT.Self) {
+        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Path`""
+        $form.Close()
+    }
+
     function Invoke-Refresh {
-        Start-Work 'Lade Status und Versionsliste ...' {
+        Start-Work (T 'prog.loading') {
             $r = [pscustomobject]@{
                 Summary    = Get-Summary
                 Table      = Get-VersionTable
                 Pending    = Get-PendingSwitch
                 Secure     = Test-FolderSecure
                 LastResult = Get-LastResult
+                Latest     = $(try { Get-LatestRelease } catch { $null })
             }
             $common = @($r.Table.Rows | Where-Object Common)
-            Write-Log ('Status: {0} | NVIDIA: {1} Versionen, {2} gemeinsam, neueste gemeinsame {3}' -f
-                $(if ($r.Summary.Ok) { "gemeinsame Version $($r.Summary.Common)" } else { "ABWEICHUNG ($($r.Summary.Versions -join ', '))" }),
-                $r.Table.Rows.Count, $common.Count, $(if ($common) { $common[0].Version } else { '-' }))
+            Write-Log (T 'log.status' $(if ($r.Summary.Ok) { T 'log.common' $r.Summary.Common } else { T 'log.mismatch' ($r.Summary.Versions -join ', ') }) `
+                $r.Table.Rows.Count $common.Count $(if ($common) { $common[0].Version } else { '-' }))
             $r
         } @() {
             param($res, $err)
@@ -995,7 +1291,7 @@ function Show-Gui {
                 }
                 $lr = $res.LastResult
                 if ($lr -and -not $lr.Shown) {
-                    Show-Msg ("Geplanter Wechsel vom {0}:`n`n{1}" -f ([datetime]$lr.Time).ToString('dd.MM.yyyy HH:mm'), $lr.Message) $(if ($lr.Ok) { 'Information' } else { 'Warning' })
+                    Show-Msg (T 'msg.lastswitch' ([datetime]$lr.Time).ToString((T 'fmt.datetime')) $lr.Message) $(if ($lr.Ok) { 'Information' } else { 'Warning' })
                     Set-LastResultShown
                 }
             }
@@ -1003,61 +1299,62 @@ function Show-Gui {
     }
 
     function Complete-Install($res, $err) {
-        if ($err) { Show-Msg "Wechsel fehlgeschlagen:`n`n$err" 'Error' }
+        if ($err) { Show-Msg (T 'msg.switchfail' $err) 'Error' }
         elseif ($res.RebootRequired) {
-            if (Ask "$($res.Message)`n`nJetzt neu starten?") { Restart-Computer -Force; return }
+            if (Ask (T 'ask.rebootnow' $res.Message)) { Restart-Computer -Force; return }
         }
         else { Show-Msg $res.Message }
         Invoke-Refresh
     }
 
-    # ---------- Ereignisse ----------
+    # ---------- events ----------
     $chkAll.Add_CheckedChanged({ Update-List })
     $btnRefresh.Add_Click({ Invoke-Refresh })
     $lv.Add_DoubleClick({ $btnSwitch.PerformClick() })
 
     $btnDownload.Add_Click({
         $r = Get-SelectedRow; if (-not $r) { return }
-        if ($r.Local) { Show-Msg "$($r.Version) ist bereits geladen und geprüft."; return }
-        if (-not $r.Url) { Show-Msg "Für $($r.Version) ist keine Download-Adresse bekannt." 'Warning'; return }
-        $text = "Version $($r.Version) herunterladen (ca. 900 MB) und prüfen?`n`nGeprüft werden Signatur, Archiv und ob beide Karten mit derselben Treiberversion enthalten sind. Installiert wird dabei nichts."
-        if (-not $r.Common) {
-            $text = "Achtung: $($r.Version) ist bei NVIDIA nicht für beide Karten gelistet. Ob das Paket trotzdem beide Karten enthält, zeigt erst die Prüfung.`n`n" + $text
-        }
+        if ($r.Local) { Show-Msg (T 'msg.alreadylocal' $r.Version); return }
+        if (-not $r.Url) { Show-Msg (T 'msg.nourl' $r.Version) 'Warning'; return }
+        $text = T 'ask.download' $r.Version
+        if (-not $r.Common) { $text = (T 'ask.download.warn' $r.Version) + $text }
         if (-not (Ask $text)) { return }
-        Start-Work "Lade $($r.Version) ..." { param($v, $u) Import-Version $v $u } @($r.Version, $r.Url) {
+        Start-Work (T 'prog.downloading' $r.Version) { param($v, $u) Import-Version $v $u } @($r.Version, $r.Url) {
             param($res, $err)
-            if ($err) { Show-Msg "Prüfung nicht bestanden, nichts wurde abgelegt:`n`n$err" 'Warning' }
-            else { Show-Msg 'Geprüft und abgelegt. Die Version kann jetzt gewechselt werden.' }
+            if ($err) { Show-Msg (T 'msg.verifyfail' $err) 'Warning' }
+            else { Show-Msg (T 'msg.verified') }
             Invoke-Refresh
         }
     })
 
     $btnSwitch.Add_Click({
         $r = Get-SelectedRow; if (-not $r) { return }
-        if (-not $r.Local) { Show-Msg "$($r.Version) ist noch nicht geladen. Bitte zuerst 'Laden und prüfen'."; return }
+        if (-not $r.Local) { Show-Msg (T 'msg.notlocal' $r.Version); return }
         $sum = $ui.State.Summary
-        if ($sum.Ok -and $sum.Common -eq $r.Version) { Show-Msg "$($r.Version) ist bereits aktiv."; return }
+        if ($sum.Ok -and $sum.Common -eq $r.Version) { Show-Msg (T 'msg.active' $r.Version); return }
 
         if ($rbNow.Checked) {
-            if (-not (Ask "Jetzt auf $($r.Version) wechseln?`n`nDauer: einige Minuten. Bildschirme an der eGPU können dabei kurz schwarz werden.")) { return }
-            Start-Work "Wechsle auf $($r.Version) ..." { param($v) Install-Version $v } @($r.Version) { param($res, $err) Complete-Install $res $err }
+            if (-not (Ask (T 'ask.switchnow' $r.Version))) { return }
+            Start-Work (T 'prog.switching' $r.Version) { param($v) Install-Version $v } @($r.Version) { param($res, $err) Complete-Install $res $err }
             return
         }
         $at = $null
         if ($rbAt.Checked) {
-            try { $at = [datetime]::ParseExact($txtAt.Text.Trim(), 'dd.MM.yyyy HH:mm', [Globalization.CultureInfo]::InvariantCulture) }
-            catch { Show-Msg 'Bitte den Zeitpunkt im Format TT.MM.JJJJ HH:MM eingeben, z. B. 01.10.2026 22:00.' 'Warning'; $txtAt.Focus(); return }
-            if ($at -lt (Get-Date).AddMinutes(1)) { Show-Msg 'Der Zeitpunkt liegt in der Vergangenheit.' 'Warning'; return }
+            try { $at = [datetime]::ParseExact($txtAt.Text.Trim(), (T 'fmt.datetime'), [Globalization.CultureInfo]::InvariantCulture) }
+            catch {
+                Show-Msg (T 'msg.badtime' (T 'fmt.human') ((Get-Date).Date.AddHours(22).ToString((T 'fmt.datetime')))) 'Warning'
+                [void]$txtAt.Focus(); return
+            }
+            if ($at -lt (Get-Date).AddMinutes(1)) { Show-Msg (T 'msg.pasttime') 'Warning'; return }
         }
         if (-not (Test-FolderSecure)) {
-            if (-not (Ask "Der Wechsel läuft später als SYSTEM. Dafür darf außer Administratoren niemand die Dateien in $($GT.Root) ändern.`n`nOrdnerrechte jetzt absichern?")) { return }
-            try { Protect-Folder } catch { Show-Msg "Absichern fehlgeschlagen:`n`n$($_.Exception.Message)" 'Error'; return }
+            if (-not (Ask (T 'ask.secureschedule' $GT.Root))) { return }
+            try { Protect-Folder } catch { Show-Msg (T 'msg.securefail' $_.Exception.Message) 'Error'; return }
         }
-        try { Register-Switch $r.Version $at } catch { Show-Msg "Planen fehlgeschlagen:`n`n$($_.Exception.Message)" 'Error'; return }
+        try { Register-Switch $r.Version $at } catch { Show-Msg (T 'msg.schedulefail' $_.Exception.Message) 'Error'; return }
         $p = Get-PendingSwitch
-        if ($rbReboot.Checked -and (Ask "Wechsel auf $($r.Version) ist für den nächsten Neustart geplant.`n`nJetzt neu starten?")) { Restart-Computer -Force; return }
-        if ($rbAt.Checked) { Show-Msg "Wechsel auf $($r.Version) geplant: $($p.When).`n`nDer Laptop muss dann eingeschaltet sein. Ist er aus, wird der Wechsel beim nächsten Start nachgeholt." }
+        if ($rbReboot.Checked -and (Ask (T 'ask.rebootscheduled' $r.Version))) { Restart-Computer -Force; return }
+        if ($rbAt.Checked) { Show-Msg (T 'msg.scheduledat' $r.Version $p.When) }
         Invoke-Refresh
     })
 
@@ -1065,52 +1362,59 @@ function Show-Gui {
 
     $btnRepair.Add_Click({
         $cur = (Get-Config).Current
-        if (-not (Ask "Alle abweichenden NVIDIA-Treiber entfernen und die gemeinsame Version $cur wiederherstellen?")) { return }
-        Start-Work "Repariere ($cur) ..." { param($v) Install-Version $v } @($cur) { param($res, $err) Complete-Install $res $err }
+        if (-not $cur) { $cur = $ui.State.Summary.Common }
+        if (-not (Ask (T 'ask.repair' $cur))) { return }
+        Start-Work (T 'prog.repair' $cur) { param($v) Install-Version $v } @($cur) { param($res, $err) Complete-Install $res $err }
     })
 
     $btnSecure.Add_Click({
-        if (-not (Ask "Schreibrechte für $($GT.Root) auf Administratoren und SYSTEM beschränken? Alle anderen dürfen nur noch lesen und ausführen.")) { return }
-        try { Protect-Folder; Show-Msg 'Ordnerrechte abgesichert.' } catch { Show-Msg "Fehlgeschlagen:`n`n$($_.Exception.Message)" 'Error' }
+        if (-not (Ask (T 'ask.secure' $GT.Root))) { return }
+        try { Protect-Folder; Show-Msg (T 'msg.secured') } catch { Show-Msg (T 'msg.failed' $_.Exception.Message) 'Error' }
         Invoke-Refresh
     })
     $btnLog.Add_Click({ Start-Process notepad.exe $GT.LogFile })
     $btnToolDir.Add_Click({ Start-Process explorer.exe $GT.Root })
+    $lnkRepo.Add_LinkClicked({ Start-Process $GT.RepoUrl })
 
-    foreach ($rb in $rbAuto, $rbLight, $rbDark) {
-        $rb.Add_CheckedChanged({
-            param($s, $e)
-            if (-not $s.Checked) { return }
-            $ui.ThemeMode = $s.Tag
-            try { Set-Setting 'Theme' $s.Tag } catch { Write-Log "Darstellung nicht gespeichert: $($_.Exception.Message)" }
-            Set-Theme (Get-SystemDark)
-        })
-    }
+    $cbTheme.Add_SelectedIndexChanged({
+        $ui.ThemeMode = $themeModes[$cbTheme.SelectedIndex]
+        try { Set-Setting 'Theme' $ui.ThemeMode } catch { }
+        Set-Theme (Get-SystemDark)
+    })
+    # a language change rebuilds the window: save the setting and restart
+    $cbLang.Add_SelectedIndexChanged({
+        $new = $langModes[$cbLang.SelectedIndex]
+        try { Set-Setting 'Language' $new } catch { }
+        if ((Resolve-Language $new) -ne $GT.Lang -and -not $sync.Busy) { Restart-Tool }
+    })
 
     $btnInstall.Add_Click({
         if (Test-Installed) {
             try {
                 New-DesktopShortcut $GT.Self
                 if (-not (Test-FolderSecure)) { Protect-Folder }
-                Show-Msg 'Desktop-Verknüpfung "GPU-Verwaltung" angelegt.'
-            } catch { Show-Msg "Fehlgeschlagen:`n`n$($_.Exception.Message)" 'Error' }
+                Show-Msg (T 'msg.shortcut')
+            } catch { Show-Msg (T 'msg.failed' $_.Exception.Message) 'Error' }
             Invoke-Refresh
             return
         }
-        $text = "Werkzeug nach $($GT.InstallDir) installieren?`n`n" +
-                "- Ordner anlegen und gegen Änderungen durch normale Benutzer absichern`n" +
-                "- Desktop-Verknüpfung 'GPU-Verwaltung' anlegen`n" +
-                "- danach von dort neu starten"
-        if (Test-Path (Join-Path $GT.InstallDir 'config.json')) {
-            $text += "`n`nDort gibt es bereits eine Installation. Einstellungen und Treiberpakete bleiben erhalten, nur das Script wird aktualisiert."
-        }
+        $text = T 'ask.install' $GT.InstallDir
+        if (Test-Path (Join-Path $GT.InstallDir 'config.json')) { $text += T 'ask.install.existing' }
         if (-not (Ask $text)) { return }
-        Start-Work 'Installiere ...' { Install-Tool } @() {
+        Start-Work (T 'prog.installing') { Install-Tool } @() {
             param($res, $err)
-            if ($err) { Show-Msg "Installation fehlgeschlagen:`n`n$err" 'Error'; return }
-            # vom neuen Pfad neu starten (Adminrechte werden vererbt)
-            Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$res`""
-            $form.Close()
+            if ($err) { Show-Msg (T 'msg.installfail' $err) 'Error'; return }
+            Restart-Tool $res   # administrator rights are inherited
+        }
+    })
+
+    $btnUpdate.Add_Click({
+        $latest = $ui.State.Latest
+        if (-not (Ask (T 'ask.update' $GT.Version $latest.Version))) { return }
+        Start-Work (T 'prog.updating') { param($t, $v) Update-Script $t $v } @($latest.Tag, "$($latest.Version)") {
+            param($res, $err)
+            if ($err) { Show-Msg (T 'msg.updatefail' $err) 'Error'; return }
+            Restart-Tool $res
         }
     })
 
@@ -1118,7 +1422,7 @@ function Show-Gui {
     $form.Add_FormClosing({
         param($s, $e)
         if ($sync.Busy -and -not $ui.Snapshot) {
-            Show-Msg 'Es läuft noch ein Vorgang. Bitte warten, bis er abgeschlossen ist.' 'Warning'
+            Show-Msg (T 'msg.busy') 'Warning'
             $e.Cancel = $true
         }
     })
@@ -1133,6 +1437,8 @@ function Show-Gui {
 #  Start
 # =============================================================================================
 
+$GT.Lang = if ($Lang) { $Lang } else { Resolve-Language (Get-Setting 'Language' 'Auto') }
+
 if ($LoadCore) { return }
 if ($Status)   { Show-Status; return }
 if ($Apply)    { Invoke-Apply; return }
@@ -1142,4 +1448,5 @@ if (-not (Test-Admin) -and -not $NoElevate) {
         -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($GT.Self)`""
     return
 }
+if (Test-Admin) { Move-LegacyPackages }
 Show-Gui
