@@ -1,0 +1,21 @@
+{
+    "Current": "596.36",
+    "KeepVersions": 2,
+    "DownloadFrom": "4070",
+    "Settings": { "Theme": "Auto" },
+    "Devices": [
+        { "Short": "A2000", "Name": "RTX A2000 (intern)", "HardwareId": "PCI\\VEN_10DE&DEV_25BA&SUBSYS_0B1A1028", "Psid": 124, "Pfid": 989 },
+        { "Short": "4070",  "Name": "RTX 4070 (eGPU)",    "HardwareId": "PCI\\VEN_10DE&DEV_2786&SUBSYS_51371462", "Psid": 127, "Pfid": 1015 }
+    ],
+    "Packages": [
+        {
+            "Version": "596.36",
+            "File": "Pakete\\596.36\\596.36-desktop-win10-win11-64bit-international-dch-whql.exe",
+            "Sha256": "4A1793D2BC7792F43270FE8286EC381AE24409FE29049DBE1EB8530ED89E19CF",
+            "DriverVersion": "32.0.15.9636",
+            "Infs": [ "nvdmi.inf", "nvmdi.inf" ],
+            "Url": "https://us.download.nvidia.com/Windows/596.36/596.36-desktop-win10-win11-64bit-international-dch-whql.exe",
+            "Added": "2026-10-01T00:09:00"
+        }
+    ]
+}
