@@ -16,7 +16,12 @@
             -LoadCore                      load functions only (used by the GUI's background work)
 
   Files:    config.json, Packages\<version>\*.exe (original NVIDIA installer, verified before every use)
-  Log:      C:\ProgramData\GpuTool\gpu-tool.log
+            Archive\<version>\ (every replaced script version with a config.json snapshot)
+  Log:      C:\ProgramData\GpuTool\gpu-tool.log (rotated at 1 MB -> gpu-tool.1.log, gpu-tool.2.log)
+  Work:     C:\ProgramData\GpuTool\work\download-<version>\ (resumable .part downloads)
+
+  Windows Update: the setting "Windows Update drivers" (Automatic / Block / Allow) controls the policy
+            ExcludeWUDriversInQualityUpdate so Windows Update can't put one card on another version.
 #>
 param(
     [string]$Apply,
@@ -30,7 +35,7 @@ param(
 )
 
 $Global:GT = @{
-    Version    = '1.1.0'
+    Version    = '1.2.0'
     Repo       = 'Jake-double-one/eGPU-Manager'
     AppName    = 'eGPU Manager'
     Self       = $PSCommandPath
@@ -46,8 +51,14 @@ $Global:GT = @{
 }
 $GT.RepoUrl    = "https://github.com/$($GT.Repo)"
 $GT.LogFile    = Join-Path $GT.DataDir 'gpu-tool.log'
+$GT.LogMaxKB   = 1024          # rotate above this size
+$GT.LogKeep    = 2             # gpu-tool.1.log, gpu-tool.2.log
 $GT.WorkDir    = Join-Path $GT.DataDir 'work'
 $GT.ResultFile = Join-Path $GT.DataDir 'last-switch.json'
+$GT.WuPolicyKey  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+$GT.WuPolicyName = 'ExcludeWUDriversInQualityUpdate'
+$GT.DownloadRetries = 5        # attempts per download (resumed with HTTP Range)
+$GT.DownloadRetryWait = 10     # seconds between attempts
 New-Item -ItemType Directory -Force -Path $GT.DataDir | Out-Null
 
 # =============================================================================================
@@ -72,8 +83,18 @@ $Global:GTStrings = @{
 
     # --- download / verify ---
     'prog.download'       = @('Download {0:N0} of {1:N0} MB', 'Download {0:N0} von {1:N0} MB')
+    'prog.download.rate'  = @('Download {0:N0} of {1:N0} MB - {2:N1} MB/s - {3} left', 'Download {0:N0} von {1:N0} MB - {2:N1} MB/s - noch {3}')
+    'prog.download.wait'  = @('Connection lost - retrying in {0} s (attempt {1} of {2}) ...', 'Verbindung verloren - neuer Versuch in {0} s (Versuch {1} von {2}) ...')
+    'log.resume'          = @('  Resuming download at {0:N0} MB', '  Setze Download bei {0:N0} MB fort')
+    'log.retry'           = @('  Download interrupted ({0}) - retrying', '  Download unterbrochen ({0}) - neuer Versuch')
+    'err.noresume'        = @('Server does not support resuming - starting over', 'Server unterstützt kein Fortsetzen - beginne von vorn')
+    'err.cancelled'       = @('Cancelled by user', 'Vom Benutzer abgebrochen')
+    'err.retries'         = @('Download failed after {0} attempts: {1}', 'Download nach {0} Versuchen fehlgeschlagen: {1}')
     'err.incomplete'      = @('Download incomplete ({0} of {1} bytes)', 'Download unvollständig ({0} von {1} Bytes)')
     'log.downloaded'      = @('  Download complete ({0:N0} bytes)', '  Download vollständig ({0:N0} Bytes)')
+    'err.badversion'      = @('Invalid version string from NVIDIA: "{0}"', 'Ungültige Versionsangabe von NVIDIA: "{0}"')
+    'time.sec'            = @('{0} s', '{0} s')
+    'time.min'            = @('{0} min {1} s', '{0} min {1} s')
     'err.7zip'            = @('7-Zip not found ({0})', '7-Zip nicht gefunden ({0})')
     'prog.sig'            = @('Checking signature ...', 'Prüfe Signatur ...')
     'err.sig'             = @('Invalid signature ({0}, {1})', 'Signatur ungültig ({0}, {1})')
@@ -121,6 +142,23 @@ $Global:GTStrings = @{
     'task.desc'           = @('eGPU Manager: one-time switch to NVIDIA {0} ({1}). Deletes itself after running.', 'eGPU Manager: einmaliger Wechsel auf NVIDIA {0} ({1}). Löscht sich nach dem Lauf selbst.')
     'log.scheduled'       = @('Switch to {0} scheduled: {1}', 'Wechsel auf {0} geplant: {1}')
     'log.unscheduled'     = @('Scheduled switch cancelled', 'Geplanter Wechsel abgebrochen')
+    'log.rotated'         = @('Log rotated ({0:N0} KB)', 'Log rotiert ({0:N0} KB)')
+
+    # --- Windows Update driver lock ---
+    'log.wu.set'          = @('Windows Update driver lock set (ExcludeWUDriversInQualityUpdate=1)', 'Windows-Update-Treibersperre gesetzt (ExcludeWUDriversInQualityUpdate=1)')
+    'log.wu.removed'      = @('Windows Update driver lock removed', 'Windows-Update-Treibersperre entfernt')
+    'err.wu.gpo'          = @('The Windows Update driver setting is managed by group policy - the tool cannot change it', 'Die Windows-Update-Treibereinstellung wird per Gruppenrichtlinie verwaltet - das Tool kann sie nicht ändern')
+    'ui.wu'               = @('Windows Update drivers:', 'Windows-Update-Treiber:')
+    'opt.wu.auto'         = @('Automatic', 'Automatisch')
+    'opt.wu.block'        = @('Block', 'Sperren')
+    'opt.wu.allow'        = @('Allow', 'Zulassen')
+    'ban.wu.on'           = @('Windows Update driver lock: active', 'Windows-Update-Treibersperre: aktiv')
+    'ban.wu.off'          = @('Windows Update driver lock: off', 'Windows-Update-Treibersperre: aus')
+    'ban.wu.gpo'          = @('Windows Update drivers: managed by group policy', 'Windows-Update-Treiber: per Gruppenrichtlinie verwaltet')
+    'tip.wu'              = @("Automatic: lock while a version installed by this tool is active, so Windows Update can't replace one card's driver.`nBlock: lock always.`nAllow: never lock (Windows Update may reinstall different versions).", "Automatisch: Sperre, solange eine mit diesem Tool installierte Version aktiv ist, damit Windows Update nicht den Treiber einer Karte ersetzt.`nSperren: Sperre immer.`nZulassen: nie sperren (Windows Update darf abweichende Versionen einspielen).")
+    'con.wu'              = @('WU driver lock', 'WU-Treibersperre')
+    'con.wu.on'           = @('active ({0})', 'aktiv ({0})')
+    'con.wu.off'          = @('off ({0})', 'aus ({0})')
 
     # --- install / update ---
     'log.install'         = @('Installing to {0}', 'Installiere nach {0}')
@@ -130,7 +168,8 @@ $Global:GTStrings = @{
     'log.shortcut'        = @('Desktop shortcut created: {0}', 'Desktop-Verknüpfung angelegt: {0}')
     'lnk.desc'            = @('Keep the internal NVIDIA GPU and the eGPU on the same driver version', 'Interne NVIDIA-GPU und eGPU auf derselben Treiberversion halten')
     'log.update'          = @('Updating eGPU Manager {0} -> {1}', 'Aktualisiere eGPU Manager {0} -> {1}')
-    'log.updated'         = @('Updated to {0} (backup: {1})', 'Aktualisiert auf {0} (Sicherung: {1})')
+    'log.updated'         = @('Updated to {0} (previous version archived in {1})', 'Aktualisiert auf {0} (vorherige Version archiviert in {1})')
+    'log.archived'        = @('Archived script version {0} -> {1}', 'Script-Version {0} archiviert -> {1}')
     'err.devcopy'         = @('This is a development copy (git repository) - update it with git pull', 'Das ist eine Entwicklerkopie (Git-Repository) - bitte mit git pull aktualisieren')
     'err.update.parse'    = @('The downloaded script contains errors - update aborted', 'Das heruntergeladene Script enthält Fehler - Update abgebrochen')
     'err.update.version'  = @('The downloaded script has an unexpected version - update aborted', 'Das heruntergeladene Script hat eine unerwartete Version - Update abgebrochen')
@@ -163,6 +202,9 @@ $Global:GTStrings = @{
     'ui.repair'           = @('Repair mismatch', 'Abweichung reparieren')
     'ui.secure'           = @('Secure folder', 'Rechte absichern')
     'ui.openlog'          = @('Open log', 'Log öffnen')
+    'ui.cancel'           = @('Cancel', 'Abbrechen')
+    'ui.cancelling'       = @('Cancelling ...', 'Breche ab ...')
+    'msg.cancelled'       = @('Download cancelled. The partial file is kept and will be resumed next time.', 'Download abgebrochen. Die Teildatei bleibt erhalten und wird beim nächsten Mal fortgesetzt.')
     'ui.theme'            = @('Theme:', 'Darstellung:')
     'ui.lang'             = @('Language:', 'Sprache:')
     'opt.auto'            = @('Automatic', 'Automatisch')
@@ -198,6 +240,7 @@ $Global:GTStrings = @{
     'msg.alreadylocal'    = @('{0} is already downloaded and verified.', '{0} ist bereits geladen und geprüft.')
     'msg.nourl'           = @('No download URL is known for {0}.', 'Für {0} ist keine Download-Adresse bekannt.')
     'ask.download'        = @("Download version {0} (approx. 900 MB) and verify it?`n`nChecked: signature, archive, and whether both cards are included with the same driver version. Nothing is installed.", "Version {0} herunterladen (ca. 900 MB) und prüfen?`n`nGeprüft werden Signatur, Archiv und ob beide Karten mit derselben Treiberversion enthalten sind. Installiert wird dabei nichts.")
+    'ask.download.resume' = @('A partial download ({0:N0} MB) exists and will be resumed.', 'Ein Teildownload ({0:N0} MB) ist vorhanden und wird fortgesetzt.')
     'ask.download.warn'   = @("Warning: NVIDIA doesn't list {0} for both cards. Only the verification shows whether the package still contains both.`n`n", "Achtung: {0} ist bei NVIDIA nicht für beide Karten gelistet. Ob das Paket trotzdem beide Karten enthält, zeigt erst die Prüfung.`n`n")
     'msg.verifyfail'      = @("Verification failed, nothing was stored:`n`n{0}", "Prüfung nicht bestanden, nichts wurde abgelegt:`n`n{0}")
     'msg.verified'        = @('Verified and stored. You can switch to this version now.', 'Geprüft und abgelegt. Die Version kann jetzt gewechselt werden.')
@@ -220,7 +263,7 @@ $Global:GTStrings = @{
     'ask.install'         = @("Install the tool to {0}?`n`n- create the folder and protect it against changes by standard users`n- create the desktop shortcut 'eGPU Manager'`n- restart from there", "Werkzeug nach {0} installieren?`n`n- Ordner anlegen und gegen Änderungen durch normale Benutzer absichern`n- Desktop-Verknüpfung 'eGPU Manager' anlegen`n- danach von dort neu starten")
     'ask.install.existing'= @("`n`nThere's already an installation there. Settings and driver packages are kept; only the script is replaced.", "`n`nDort gibt es bereits eine Installation. Einstellungen und Treiberpakete bleiben erhalten, nur das Script wird ersetzt.")
     'msg.installfail'     = @("Installation failed:`n`n{0}", "Installation fehlgeschlagen:`n`n{0}")
-    'ask.update'          = @("Update eGPU Manager from {0} to {1}?`n`nThe new version is downloaded from GitHub and checked, then the tool restarts. Settings and driver packages are kept.", "eGPU Manager von {0} auf {1} aktualisieren?`n`nDie neue Version wird von GitHub geladen und geprüft, danach startet das Werkzeug neu. Einstellungen und Treiberpakete bleiben erhalten.")
+    'ask.update'          = @("Update eGPU Manager from {0} to {1}?`n`nThe new version is downloaded from GitHub and checked, then the tool restarts. Settings and driver packages are kept; the current script is archived in Archive\{0}\.", "eGPU Manager von {0} auf {1} aktualisieren?`n`nDie neue Version wird von GitHub geladen und geprüft, danach startet das Werkzeug neu. Einstellungen und Treiberpakete bleiben erhalten; das aktuelle Script wird in Archive\{0}\ archiviert.")
     'msg.updatefail'      = @("Update failed:`n`n{0}", "Update fehlgeschlagen:`n`n{0}")
 }
 
@@ -236,14 +279,54 @@ function T([string]$Key) {
 #  Basics
 # =============================================================================================
 
+# Log rotation: above LogMaxKB the log is moved to gpu-tool.1.log (and that one to gpu-tool.2.log)
+function Invoke-LogRotation {
+    try {
+        $f = Get-Item $GT.LogFile -ErrorAction Stop
+        if ($f.Length -lt ($GT.LogMaxKB * 1KB)) { return }
+        $base = [IO.Path]::Combine($f.DirectoryName, [IO.Path]::GetFileNameWithoutExtension($f.Name))
+        for ($i = $GT.LogKeep; $i -ge 1; $i--) {
+            $src = if ($i -eq 1) { $f.FullName } else { "$base.$($i - 1).log" }
+            if (Test-Path $src) { Move-Item $src "$base.$i.log" -Force -ErrorAction Stop }
+        }
+        $line = '{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), (T 'log.rotated' ($f.Length / 1KB))
+        Set-Content -Path $GT.LogFile -Value $line -Encoding UTF8
+    } catch { }
+}
+
 function Write-Log([string]$Msg) {
     $line = '{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Msg
-    try { Add-Content -Path $GT.LogFile -Value $line -Encoding UTF8 -ErrorAction Stop } catch { }
+    try {
+        if ((Get-Random -Maximum 50) -eq 0) { Invoke-LogRotation }   # size check on roughly every 50th line
+        Add-Content -Path $GT.LogFile -Value $line -Encoding UTF8 -ErrorAction Stop
+    } catch { }
     if ($Global:GtSync) { $Global:GtSync.Log.Enqueue($line) } else { Write-Host $line }
 }
 
 function Set-Progress([int]$Percent, [string]$Text) {
     if ($Global:GtSync) { $Global:GtSync.Progress = $Percent; $Global:GtSync.ProgressText = $Text }
+}
+
+# Cancel flag set by the GUI; long-running work checks it between steps
+function Test-Cancelled {
+    [bool]($Global:GtSync -and $Global:GtSync.Cancel)
+}
+
+# NVIDIA version strings look like 596.36 or 580.88. Everything else is rejected before it reaches a
+# path, a command line or a file name.
+function Test-NvVersionString([string]$Version) {
+    "$Version" -match '^\d{3}\.\d{2,3}$'
+}
+
+function Assert-NvVersionString([string]$Version) {
+    if (-not (Test-NvVersionString $Version)) { throw (T 'err.badversion' $Version) }
+}
+
+# Seconds -> "45 s" / "3 min 12 s"
+function Format-Duration([double]$Seconds) {
+    if ($Seconds -lt 0 -or [double]::IsInfinity($Seconds) -or [double]::IsNaN($Seconds)) { return '?' }
+    $s = [int][Math]::Round($Seconds)
+    if ($s -lt 60) { T 'time.sec' $s } else { T 'time.min' ([int][Math]::Floor($s / 60)) ($s % 60) }
 }
 
 function Test-Admin {
@@ -266,7 +349,7 @@ function New-DefaultConfig {
         Current      = ''
         KeepVersions = 2
         DownloadFrom = '4070'
-        Settings     = [pscustomobject]@{ Theme = 'Auto'; Language = 'Auto' }
+        Settings     = [pscustomobject]@{ Theme = 'Auto'; Language = 'Auto'; WuDrivers = 'Auto' }   # WuDrivers: Auto / Block / Allow
         Devices      = @(
             [pscustomobject]@{ Short = 'A2000'; Name = 'RTX A2000 (internal)'; HardwareId = 'PCI\VEN_10DE&DEV_25BA&SUBSYS_0B1A1028'; Psid = 124; Pfid = 989 },
             [pscustomobject]@{ Short = '4070';  Name = 'RTX 4070 (eGPU)';      HardwareId = 'PCI\VEN_10DE&DEV_2786&SUBSYS_51371462'; Psid = 127; Pfid = 1015 }
@@ -311,6 +394,70 @@ function ConvertTo-NvVersion([string]$DriverVersion) {
     if ($p.Count -ne 4) { return $null }
     $d = $p[2].Substring($p[2].Length - 1) + $p[3].PadLeft(4, '0')
     '{0}.{1}' -f $d.Substring(0, 3), $d.Substring(3)
+}
+
+# =============================================================================================
+#  Windows Update driver lock
+#  Policy ExcludeWUDriversInQualityUpdate=1 stops Windows Update from installing drivers, which
+#  is the usual way one of the two cards ends up on a different NVIDIA version again.
+#  Setting WuDrivers: Auto  = lock while a version installed by this tool is active (Current set)
+#                     Block = lock always
+#                     Allow = never lock
+#  A domain group policy owns the value when its .reg source is GPO; the tool only reports then.
+# =============================================================================================
+
+function Get-WuDriverLock {
+    $v = $null
+    try { $v = (Get-ItemProperty -Path $GT.WuPolicyKey -Name $GT.WuPolicyName -ErrorAction Stop).($GT.WuPolicyName) } catch { }
+    [pscustomobject]@{
+        Locked = ([int]$v -eq 1)
+        Mode   = Get-Setting 'WuDrivers' 'Auto'
+        Gpo    = Test-WuPolicyFromGpo
+    }
+}
+
+# The policy comes from a domain or local GPO when it also shows up in the Group Policy registry cache
+function Test-WuPolicyFromGpo {
+    $pol = Join-Path $env:SystemRoot 'System32\GroupPolicy\Machine\Registry.pol'
+    if (-not (Test-Path $pol)) { return $false }
+    try {
+        $bytes = [IO.File]::ReadAllBytes($pol)
+        $text  = [Text.Encoding]::Unicode.GetString($bytes)
+        $text -match [regex]::Escape($GT.WuPolicyName)
+    } catch { $false }
+}
+
+# Wanted state for the current mode
+function Get-WuDriverLockWanted([string]$Mode) {
+    switch ($Mode) {
+        'Block' { $true }
+        'Allow' { $false }
+        default { [bool]((Get-Config).Current) }
+    }
+}
+
+function Set-WuDriverLock([bool]$Lock) {
+    if (-not (Test-Admin)) { throw (T 'err.admin') }
+    if (Test-WuPolicyFromGpo) { throw (T 'err.wu.gpo') }
+    $cur = Get-WuDriverLock
+    if ($cur.Locked -eq $Lock) { return $false }
+    if ($Lock) {
+        New-Item -Path $GT.WuPolicyKey -Force | Out-Null
+        New-ItemProperty -Path $GT.WuPolicyKey -Name $GT.WuPolicyName -Value 1 -PropertyType DWord -Force | Out-Null
+        Write-Log (T 'log.wu.set')
+    } else {
+        Remove-ItemProperty -Path $GT.WuPolicyKey -Name $GT.WuPolicyName -ErrorAction SilentlyContinue
+        Write-Log (T 'log.wu.removed')
+    }
+    $true
+}
+
+# Brings the registry in line with the setting. Called after refresh, switch and scheduled runs.
+# Returns $true when something changed. Never throws (a GPO-managed value is just reported).
+function Sync-WuDriverLock {
+    if (-not (Test-Admin)) { return $false }
+    $mode = Get-Setting 'WuDrivers' 'Auto'
+    try { Set-WuDriverLock (Get-WuDriverLockWanted $mode) } catch { Write-Log (T 'log.error' $_.Exception.Message); $false }
 }
 
 # =============================================================================================
@@ -371,9 +518,13 @@ function Get-OnlineList([int]$Psid, [int]$Pfid) {
          '&dltype=-1&dch=1&upCRD=0&qnf=0&sort1=0&numberOfResults=100'
     foreach ($e in (Invoke-RestMethod -UseBasicParsing -Uri $u -TimeoutSec 30).IDS) {
         $i = $e.downloadInfo
+        # everything from the API is untrusted input: only well-formed versions and https NVIDIA URLs get through
+        if (-not (Test-NvVersionString $i.Version)) { Write-Log (T 'err.badversion' $i.Version); continue }
+        $url = "$($i.DownloadURL)"
+        if ($url -notmatch '^https://[a-z0-9.-]+\.nvidia\.com/') { $url = $null }
         $date = $null
         try { $date = [datetime]::ParseExact($i.ReleaseDateTime, 'ddd MMM dd, yyyy', [Globalization.CultureInfo]::InvariantCulture) } catch { }
-        [pscustomobject]@{ Version = $i.Version; Date = $date; Url = $i.DownloadURL; Name = [uri]::UnescapeDataString($i.Name) }
+        [pscustomobject]@{ Version = "$($i.Version)"; Date = $date; Url = $url; Name = [uri]::UnescapeDataString("$($i.Name)") }
     }
 }
 
@@ -412,23 +563,158 @@ function Get-VersionTable {
 #  Download, verify, store packages
 # =============================================================================================
 
+# Resumable download.
+#   - writes to <Path>.part and renames when complete
+#   - an existing .part is continued with an HTTP Range request (the server's ETag/Last-Modified
+#     is kept in <Path>.part.meta so a changed file on the server starts over)
+#   - up to $GT.DownloadRetries attempts; a dropped connection waits $GT.DownloadRetryWait seconds
+#   - progress text shows speed (last ~5 s) and remaining time, cancel keeps the .part for next time
 function Save-Download([string]$Url, [string]$Path) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $resp  = ([Net.HttpWebRequest]::Create($Url)).GetResponse()
-    $total = $resp.ContentLength
-    $in    = $resp.GetResponseStream()
-    $out   = [IO.File]::Create($Path)
-    $buf   = New-Object byte[] (4MB)
-    $done  = [int64]0; $last = -1
+    $part = "$Path.part"
+    $meta = "$Path.part.meta"
+    # a completed file that was never verified (interrupted earlier) is treated like a .part
+    if ((Test-Path $Path) -and -not (Test-Path $part)) { Move-Item $Path $part -Force }
+
+    $attempt = 0
+    $lastErr = $null
+    while ($true) {
+        if (Test-Cancelled) { throw (T 'err.cancelled') }
+        $attempt++
+        try {
+            if (Invoke-DownloadAttempt $Url $part $meta) { break }
+            # $false = the partial file didn't match the server's file any more - start over
+            # (counts as an attempt, so a server that keeps rejecting us can't loop forever)
+            Remove-Item $part, $meta -Force -ErrorAction SilentlyContinue
+            Write-Log (T 'err.noresume')
+            if ($attempt -ge $GT.DownloadRetries) { throw (T 'err.retries' $attempt (T 'err.noresume')) }
+            continue
+        }
+        catch {
+            $ex = Get-InnerException $_.Exception
+            if ($ex -is [OperationCanceledException]) { throw (T 'err.cancelled') }
+            $lastErr = $ex.Message
+            $status  = Get-WebStatus $ex
+            if ($status -and $status -notin 408, 416, 429, 500, 502, 503, 504) {
+                throw (T 'err.retries' $attempt $lastErr)   # 403/404 etc. won't get better by retrying
+            }
+            Write-Log (T 'log.retry' $lastErr)
+        }
+        if ($attempt -ge $GT.DownloadRetries) { throw (T 'err.retries' $attempt $lastErr) }
+        # wait with a countdown; cancel works here too
+        for ($s = $GT.DownloadRetryWait; $s -gt 0; $s--) {
+            if (Test-Cancelled) { throw (T 'err.cancelled') }
+            Set-Progress -1 (T 'prog.download.wait' $s ($attempt + 1) $GT.DownloadRetries)
+            Start-Sleep -Seconds 1
+        }
+    }
+    Remove-Item $meta -Force -ErrorAction SilentlyContinue
+    Move-Item $part $Path -Force
+    $len = (Get-Item $Path).Length
+    Set-Progress 100 (T 'prog.download' ($len / 1MB) ($len / 1MB))
+    Write-Log (T 'log.downloaded' $len)
+}
+
+# PowerShell wraps exceptions from .NET calls (MethodInvocationException); this returns the real one
+function Get-InnerException($Exception) {
+    $ex = $Exception
+    while ($ex -is [Management.Automation.MethodInvocationException] -and $ex.InnerException) { $ex = $ex.InnerException }
+    $ex
+}
+
+# HTTP status code behind an exception (WebException with a response), or $null
+function Get-WebStatus($Exception) {
+    $ex = Get-InnerException $Exception
+    while ($ex) {
+        if ($ex -is [Net.WebException] -and $ex.Response) { return [int]$ex.Response.StatusCode }
+        $ex = $ex.InnerException
+    }
+    $null
+}
+
+# One attempt. Returns $true when the file is complete, $false when the partial file must be discarded.
+# Throws on network errors (caller retries) and OperationCanceledException when the user cancels.
+function Invoke-DownloadAttempt([string]$Url, [string]$Part, [string]$Meta) {
+    $done = [int64]0
+    if (Test-Path $Part) { $done = (Get-Item $Part).Length }
+    $tag = $null
+    if ($done -gt 0 -and (Test-Path $Meta)) { $tag = "$(Get-Content $Meta -Raw -ErrorAction SilentlyContinue)".Trim() }
+    if ($done -gt 0 -and -not $tag) { return $false }   # partial file of unknown origin
+
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.Timeout = 30000; $req.ReadWriteTimeout = 30000
+    $req.UserAgent = "eGPU-Manager/$($GT.Version)"
+    $req.AllowAutoRedirect = $true
+    if ($done -gt 0) { $req.AddRange([int64]$done) }
+
+    $resp = $null
+    try { $resp = $req.GetResponse() }
+    catch {
+        if ((Get-WebStatus $_.Exception) -eq 416) {
+            # range not satisfiable: either we already have everything or the file changed
+            $head = [Net.HttpWebRequest]::Create($Url); $head.Method = 'HEAD'; $head.Timeout = 30000
+            $hr = $head.GetResponse()
+            try { $len = $hr.ContentLength; $htag = Get-ServerTag $hr $len } finally { $hr.Close() }
+            if ($len -eq $done -and $htag -eq $tag) { Set-Progress 100 (T 'prog.download' ($done / 1MB) ($done / 1MB)); return $true }
+            return $false
+        }
+        throw
+    }
+
+    $in = $null; $out = $null
     try {
+        $status = [int]$resp.StatusCode
+        if ($done -gt 0) {
+            if ($status -ne 206) { return $false }     # server ignored the range
+            $cr = "$($resp.Headers['Content-Range'])"
+            $total = if ($cr -match '/(\d+)\s*$') { [int64]$Matches[1] } else { $done + $resp.ContentLength }
+            if ((Get-ServerTag $resp $total) -ne $tag) { return $false }   # file changed on the server
+            Write-Log (T 'log.resume' ($done / 1MB))
+        } else {
+            $total = $resp.ContentLength
+            Set-Content -Path $Meta -Value (Get-ServerTag $resp $total) -Encoding ASCII
+        }
+
+        $in  = $resp.GetResponseStream()
+        $out = New-Object IO.FileStream($Part, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        $buf = New-Object byte[] (1MB)
+        $sw  = [Diagnostics.Stopwatch]::StartNew()
+        $lastText = 0.0
+        $window = New-Object Collections.Generic.Queue[object]   # (seconds, bytes) samples for the speed
+        $window.Enqueue(@($sw.Elapsed.TotalSeconds, $done))
         while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
             $out.Write($buf, 0, $n); $done += $n
-            $pct = [int](100 * $done / [Math]::Max(1, $total))
-            if ($pct -ne $last) { Set-Progress $pct (T 'prog.download' ($done / 1MB) ($total / 1MB)); $last = $pct }
+            if (Test-Cancelled) { throw (New-Object OperationCanceledException) }
+            $now = $sw.Elapsed.TotalSeconds
+            if ($now - $lastText -ge 0.5) {
+                $lastText = $now
+                $window.Enqueue(@($now, $done))
+                while ($window.Count -gt 1 -and ($now - $window.Peek()[0]) -gt 5) { [void]$window.Dequeue() }
+                $first = $window.Peek()
+                $rate  = if ($now - $first[0] -gt 0) { ($done - $first[1]) / ($now - $first[0]) } else { 0 }
+                $left  = if ($rate -gt 0) { Format-Duration (($total - $done) / $rate) } else { '?' }
+                $pct   = [int](100 * $done / [Math]::Max(1, $total))
+                Set-Progress $pct (T 'prog.download.rate' ($done / 1MB) ($total / 1MB) ($rate / 1MB) $left)
+            }
         }
-    } finally { $out.Close(); $in.Close(); $resp.Close() }
-    if ($done -ne $total) { throw (T 'err.incomplete' $done $total) }
-    Write-Log (T 'log.downloaded' $done)
+    } finally {
+        if ($out) { $out.Close() }
+        if ($in)  { $in.Close() }
+        $resp.Close()
+    }
+    if ($total -lt 0) { $total = $done }   # no Content-Length from the server: accept what arrived
+    if ($done -lt $total) { throw (T 'err.incomplete' $done $total) }   # connection closed early -> retry resumes
+    if ($done -gt $total) { return $false }
+    $true
+}
+
+# ETag (preferred), Last-Modified or at least the total size of a response, used to notice a changed file
+# between attempts. Written to the .meta file as one line.
+function Get-ServerTag($Response, [int64]$Total) {
+    $t = "$($Response.Headers['ETag'])".Trim()
+    if (-not $t) { $t = "$($Response.Headers['Last-Modified'])".Trim() }
+    if (-not $t) { $t = "len:$Total" }
+    ($t -replace '[\r\n]', '')
 }
 
 # Verifies an NVIDIA package: signature, archive, both cards included, same driver version, signed catalog
@@ -471,15 +757,19 @@ function Test-Package([string]$Exe) {
 }
 
 function Import-Version([string]$Version, [string]$Url) {
+    Assert-NvVersionString $Version
     if (-not $Url) { throw (T 'err.nourl' $Version) }
     Write-Log (T 'log.import' $Version)
     $name = [IO.Path]::GetFileName(([uri]$Url).AbsolutePath)
+    if ($name -notmatch '^[\w.\-]+\.exe$') { throw (T 'err.nourl' $Version) }
+    # the download folder survives failed and cancelled attempts so the .part can be resumed
     $tmp  = Join-Path $GT.WorkDir "download-$Version"
-    Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    $downloaded = $false
     try {
         $file = Join-Path $tmp $name
         Save-Download $Url $file
+        $downloaded = $true
         $info = Test-Package $file
 
         $dir = Join-Path $GT.PkgDir $Version
@@ -499,9 +789,20 @@ function Import-Version([string]$Version, [string]$Url) {
         $cfg.Packages = @(@($cfg.Packages | Where-Object { $_.Version -ne $Version }) + $pkg)
         Save-Config $cfg
         Write-Log (T 'log.imported' $Version $info.DriverVersion)
-    } finally { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    } finally {
+        # a complete download is either stored or proven bad -> the folder goes; an incomplete one stays
+        if ($downloaded) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    }
     Remove-OldPackages -Keep $Version
     $true
+}
+
+# Partial download waiting in the work folder for this version (bytes), or 0
+function Get-PartialDownload([string]$Version) {
+    $dir = Join-Path $GT.WorkDir "download-$Version"
+    if (-not (Test-Path $dir)) { return [int64]0 }
+    $p = Get-ChildItem $dir -Filter '*.part' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($p) { [int64]$p.Length } else { [int64]0 }
 }
 
 # Keeps the installed version and at most KeepVersions packages in total
@@ -526,6 +827,7 @@ function Remove-OldPackages([string]$Keep) {
 
 function Install-Version([string]$Version) {
     if (-not (Test-Admin)) { throw (T 'err.admin') }
+    Assert-NvVersionString $Version
     $cfg = Get-Config
     $pkg = @($cfg.Packages) | Where-Object Version -eq $Version | Select-Object -First 1
     if (-not $pkg) { throw (T 'err.notlocal' $Version) }
@@ -573,6 +875,7 @@ function Install-Version([string]$Version) {
     $cfg.Current = $Version
     Save-Config $cfg
     Remove-OldPackages
+    [void](Sync-WuDriverLock)   # in Auto mode the lock becomes active with the first switch
 
     Start-Sleep -Seconds 5
     $s = Get-Summary
@@ -610,12 +913,14 @@ function Protect-Folder([string]$Path = $GT.Root) {
 }
 
 function Register-Switch([string]$Version, $At) {
+    Assert-NvVersionString $Version   # the version becomes part of a SYSTEM command line
     if (-not (Test-FolderSecure)) { throw (T 'err.notsecure' $GT.Root) }
     $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($GT.Self)`" -Apply $Version -FromTask"
     $act = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arg
     if ($At) { $trg = New-ScheduledTaskTrigger -Once -At $At }
     else     { $trg = New-ScheduledTaskTrigger -AtStartup; $trg.Delay = 'PT1M' }
-    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+    # WakeToRun: a timed switch also runs when the laptop is asleep at that moment
+    $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -WakeToRun -ExecutionTimeLimit (New-TimeSpan -Hours 1)
     $prn = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $when = if ($At) { ([datetime]$At).ToString((T 'fmt.datetime')) } else { T 'when.reboot' }
     Register-ScheduledTask -TaskName $GT.TaskName -Action $act -Trigger $trg -Settings $set -Principal $prn -Force `
@@ -685,15 +990,55 @@ function New-DesktopShortcut([string]$Script) {
     Write-Log (T 'log.shortcut' $lnk)
 }
 
+# Version string inside a script file ("Version = '1.1.0'"), or $null
+function Get-ScriptFileVersion([string]$Path) {
+    try {
+        $m = [regex]::Match((Get-Content $Path -Raw -Encoding UTF8), "Version\s*=\s*'(\d+\.\d+\.\d+)'")
+        if ($m.Success) { $m.Groups[1].Value }
+    } catch { $null }
+}
+
+# Keeps the script that is about to be replaced: Archive\<version>\GpuTool.ps1 next to it, plus a
+# snapshot of config.json from that moment. Nothing is ever overwritten in the archive.
+# Returns the archive folder.
+function Backup-Script([string]$ScriptPath) {
+    $root = Split-Path $ScriptPath
+    $ver  = Get-ScriptFileVersion $ScriptPath
+    if (-not $ver) { $ver = 'unknown' }
+    $dir  = Join-Path (Join-Path $root 'Archive') $ver
+    if (Test-Path (Join-Path $dir 'GpuTool.ps1')) {
+        # same version archived before -> keep both, with a timestamp
+        $dir = Join-Path (Join-Path $root 'Archive') ('{0}_{1}' -f $ver, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    Copy-Item $ScriptPath (Join-Path $dir 'GpuTool.ps1') -Force
+    $cfg = Join-Path $root 'config.json'
+    if (Test-Path $cfg) { Copy-Item $cfg (Join-Path $dir 'config.json') -Force }
+    # a .bak left behind by 1.1 is moved into the archive as well
+    $bak = "$ScriptPath.bak"
+    if (Test-Path $bak) {
+        $bv = Get-ScriptFileVersion $bak
+        if (-not $bv) { $bv = 'unknown' }
+        $bd = Join-Path (Join-Path $root 'Archive') $bv
+        if (-not (Test-Path (Join-Path $bd 'GpuTool.ps1'))) {
+            New-Item -ItemType Directory -Force -Path $bd | Out-Null
+            Move-Item $bak (Join-Path $bd 'GpuTool.ps1') -Force
+        } else { Remove-Item $bak -Force -ErrorAction SilentlyContinue }
+    }
+    Write-Log (T 'log.archived' $ver $dir)
+    $dir
+}
+
 # Copies the tool to C:\Scripts\GpuTool, secures the folder and creates the shortcut.
-# An existing installation keeps its settings and packages; only the script is replaced.
-# Returns the path of the installed script.
+# An existing installation keeps its settings and packages; only the script is replaced
+# (the replaced script goes to Archive\<version>\). Returns the path of the installed script.
 function Install-Tool {
     $dst    = $GT.InstallDir
     $target = Join-Path $dst 'GpuTool.ps1'
     New-Item -ItemType Directory -Force -Path $dst | Out-Null
     if (-not (Test-Installed)) {
         Write-Log (T 'log.install' $dst)
+        if ((Test-Path $target) -and (Get-FileHash $target).Hash -ne (Get-FileHash $GT.Self).Hash) { Backup-Script $target | Out-Null }
         Copy-Item $GT.Self $target -Force
         if (Test-Path (Join-Path $dst 'config.json')) {
             Write-Log (T 'log.existing')
@@ -745,8 +1090,7 @@ function Update-Script([string]$Tag, [string]$Version) {
     if (-not ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)) {
         $bytes = [byte[]](0xEF, 0xBB, 0xBF) + $bytes
     }
-    $backup = "$($GT.Self).bak"
-    Copy-Item $GT.Self $backup -Force
+    $backup = Backup-Script $GT.Self
     [IO.File]::WriteAllBytes($GT.Self, $bytes)
     Remove-Item $tmp -ErrorAction SilentlyContinue
     Write-Log (T 'log.updated' $Version $backup)
@@ -767,10 +1111,14 @@ function Show-Status {
     else       { Write-Host (T 'con.mismatch' ($s.Versions -join ', ')) -ForegroundColor Yellow }
     $p = Get-PendingSwitch
     if ($p) { Write-Host (T 'con.pending' $p.Version $p.When) }
+    $wu = Get-WuDriverLock
+    $wuText = if ($wu.Gpo) { T 'ban.wu.gpo' } elseif ($wu.Locked) { T 'con.wu.on' $wu.Mode } else { T 'con.wu.off' $wu.Mode }
+    Write-Host ('{0,-22} {1}' -f (T 'con.wu'), $wuText)
 }
 
 function Invoke-Apply {
     if (-not (Test-Admin)) { Write-Log (T 'err.applyadmin'); exit 1 }
+    if (-not (Test-NvVersionString $Apply)) { Write-Log (T 'err.badversion' $Apply); exit 1 }
     Move-LegacyPackages
     try { $r = Install-Version $Apply }
     catch {
@@ -804,7 +1152,7 @@ function Show-Gui {
 
     $sync = [hashtable]::Synchronized(@{
         Log = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
-        Progress = -1; ProgressText = ''; Busy = $false; Done = $false; Result = $null; Error = $null
+        Progress = -1; ProgressText = ''; Busy = $false; Done = $false; Result = $null; Error = $null; Cancel = $false
     })
     $Global:GtSync = $sync
     $ui  = @{ State = $null; Job = $null; OnDone = $null; Buttons = @(); FirstLoad = $true; Snapshot = $Snapshot }
@@ -898,8 +1246,8 @@ function Show-Gui {
     $form.AutoScaleMode = 'Dpi'
     $form.Font = New-Object Drawing.Font('Segoe UI', 9)
     $form.Text = "$($GT.AppName) $($GT.Version)"
-    $form.ClientSize = New-Object Drawing.Size(900, 760)
-    $form.MinimumSize = New-Object Drawing.Size(820, 680)
+    $form.ClientSize = New-Object Drawing.Size(900, 800)
+    $form.MinimumSize = New-Object Drawing.Size(820, 720)
     $form.StartPosition = 'CenterScreen'
     try { $form.Icon = [Drawing.Icon]::ExtractAssociatedIcon("$env:SystemRoot\System32\dxdiag.exe") } catch { }
 
@@ -1033,8 +1381,11 @@ function Show-Gui {
     $progress = New-Object Windows.Forms.ProgressBar
     $progress.Size = New-Object Drawing.Size(260, 16); $progress.MarqueeAnimationSpeed = 30
     $progress.Margin = New-Object Windows.Forms.Padding(0, 6, 8, 6)
+    $btnCancelWork = New-Object Windows.Forms.Button   # not in $ui.Buttons: it stays enabled while work runs
+    $btnCancelWork.Text = T 'ui.cancel'; $btnCancelWork.AutoSize = $true; $btnCancelWork.Visible = $false
+    $btnCancelWork.Padding = New-Object Windows.Forms.Padding(6, 0, 6, 0); $btnCancelWork.Margin = New-Object Windows.Forms.Padding(0, 2, 8, 2)
     $lblProgress = New-Label '' 6
-    $flProg.Controls.AddRange(@($progress, $lblProgress))
+    $flProg.Controls.AddRange(@($progress, $btnCancelWork, $lblProgress))
     $root.Controls.Add($flProg, 0, 5)
 
     # ---------- log ----------
@@ -1045,11 +1396,13 @@ function Show-Gui {
     $root.Controls.Add($txtLog, 0, 6)
 
     # ---------- settings bar (bottom) ----------
+    # two rows: settings (left) above, version / GitHub / install buttons (right-aligned) below
     $tlSettings = New-Object Windows.Forms.TableLayoutPanel
-    $tlSettings.Dock = 'Fill'; $tlSettings.AutoSize = $true; $tlSettings.ColumnCount = 2
+    $tlSettings.Dock = 'Fill'; $tlSettings.AutoSize = $true; $tlSettings.ColumnCount = 1; $tlSettings.RowCount = 2
     $tlSettings.Margin = New-Object Windows.Forms.Padding(0, 8, 8, 0)
     [void]$tlSettings.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle([Windows.Forms.SizeType]::Percent, 100)))
-    [void]$tlSettings.ColumnStyles.Add((New-Object Windows.Forms.ColumnStyle([Windows.Forms.SizeType]::AutoSize)))
+    [void]$tlSettings.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::AutoSize)))
+    [void]$tlSettings.RowStyles.Add((New-Object Windows.Forms.RowStyle([Windows.Forms.SizeType]::AutoSize)))
 
     $themeModes = @('Auto', 'Light', 'Dark')
     $langModes  = @('Auto', 'en', 'de')
@@ -1058,10 +1411,17 @@ function Show-Gui {
     $flLeft.WrapContents = $false
     $cbTheme = New-Combo @((T 'opt.auto'), (T 'opt.light'), (T 'opt.dark')) ([Math]::Max(0, [array]::IndexOf($themeModes, $ui.ThemeMode))) 110
     $cbLang  = New-Combo @((T 'opt.auto'), 'English', 'Deutsch') ([Math]::Max(0, [array]::IndexOf($langModes, $langSet))) 110
-    $flLeft.Controls.AddRange(@((New-Label (T 'ui.theme')), $cbTheme, (New-Label (T 'ui.lang')), $cbLang))
+    $wuModes = @('Auto', 'Block', 'Allow')
+    $wuSet   = Get-Setting 'WuDrivers' 'Auto'
+    $cbWu    = New-Combo @((T 'opt.wu.auto'), (T 'opt.wu.block'), (T 'opt.wu.allow')) ([Math]::Max(0, [array]::IndexOf($wuModes, $wuSet))) 110
+    $lblWu   = New-Label (T 'ui.wu')
+    $tip = New-Object Windows.Forms.ToolTip
+    $tip.AutoPopDelay = 20000
+    $tip.SetToolTip($cbWu, (T 'tip.wu')); $tip.SetToolTip($lblWu, (T 'tip.wu'))
+    $flLeft.Controls.AddRange(@((New-Label (T 'ui.theme')), $cbTheme, (New-Label (T 'ui.lang')), $cbLang, $lblWu, $cbWu))
 
     $flRight = New-Flow
-    $flRight.WrapContents = $false
+    $flRight.WrapContents = $false; $flRight.Dock = 'None'; $flRight.Anchor = 'Right'
     $lblVersion = New-Label ("v$($GT.Version)" + $(if (Test-DevCopy) { " ($(T 'ui.dev'))" } else { '' }))
     $lnkRepo = New-Object Windows.Forms.LinkLabel
     $lnkRepo.Text = 'GitHub'; $lnkRepo.AutoSize = $true; $lnkRepo.Margin = New-Object Windows.Forms.Padding(0, 8, 12, 3)
@@ -1073,25 +1433,27 @@ function Show-Gui {
     $flRight.Controls.AddRange(@($lblVersion, $lnkRepo, $btnUpdate, $btnInstall, $btnToolDir))
 
     $tlSettings.Controls.Add($flLeft, 0, 0)
-    $tlSettings.Controls.Add($flRight, 1, 0)
+    $tlSettings.Controls.Add($flRight, 0, 1)
     $root.Controls.Add($tlSettings, 0, 7)
 
     $form.ResumeLayout($false)
     $form.PerformLayout()
 
     # ---------- background work ----------
-    function Set-Busy([bool]$Busy) {
+    function Set-Busy([bool]$Busy, [bool]$Cancellable = $false) {
         foreach ($b in $ui.Buttons) { $b.Enabled = -not $Busy }
-        $chkAll.Enabled = -not $Busy; $cbLang.Enabled = -not $Busy
+        $chkAll.Enabled = -not $Busy; $cbLang.Enabled = -not $Busy; $cbWu.Enabled = -not $Busy
+        $btnCancelWork.Visible = ($Busy -and $Cancellable); $btnCancelWork.Enabled = $true; $btnCancelWork.Text = T 'ui.cancel'
         if ($Busy) { $progress.Style = 'Marquee' }
         else { $progress.Style = 'Continuous'; $progress.Value = 0; $lblProgress.Text = '' }
     }
 
-    function Start-Work([string]$Title, [scriptblock]$Work, [object[]]$Arguments, [scriptblock]$OnDone) {
+    # $Cancellable: the work checks Test-Cancelled (downloads do); the Cancel button appears next to the progress bar
+    function Start-Work([string]$Title, [scriptblock]$Work, [object[]]$Arguments, [scriptblock]$OnDone, [bool]$Cancellable = $false) {
         if ($sync.Busy) { return }
-        $sync.Busy = $true; $sync.Done = $false; $sync.Result = $null; $sync.Error = $null
+        $sync.Busy = $true; $sync.Done = $false; $sync.Result = $null; $sync.Error = $null; $sync.Cancel = $false
         $sync.Progress = -1; $sync.ProgressText = $Title
-        Set-Busy $true
+        Set-Busy $true $Cancellable
         $rs = [runspacefactory]::CreateRunspace()
         $rs.ApartmentState = 'STA'; $rs.Open()
         $rs.SessionStateProxy.SetVariable('GtSync', $sync)
@@ -1151,6 +1513,10 @@ function Show-Gui {
         }
 
         $storeText = T 'ban.store' ((@($sum.Store) | ForEach-Object { "$($_.Original) $($_.NvVersion)" }) -join ', ')
+        if ($st.Wu) {
+            $wuText = if ($st.Wu.Gpo) { T 'ban.wu.gpo' } elseif ($st.Wu.Locked) { T 'ban.wu.on' } else { T 'ban.wu.off' }
+            $storeText += '   |   ' + $wuText
+        }
         if ($sum.Ok -and $sum.Common) {
             $banner.Text = (T 'ban.ok' $sum.Common) + "`r`n" + $storeText
             $banner.BackColor = $C.GreenBg; $banner.ForeColor = $C.Green
@@ -1265,11 +1631,14 @@ function Show-Gui {
 
     function Invoke-Refresh {
         Start-Work (T 'prog.loading') {
+            Invoke-LogRotation
+            [void](Sync-WuDriverLock)   # registry follows the setting (Auto: lock once a tool-installed version is active)
             $r = [pscustomobject]@{
                 Summary    = Get-Summary
                 Table      = Get-VersionTable
                 Pending    = Get-PendingSwitch
                 Secure     = Test-FolderSecure
+                Wu         = Get-WuDriverLock
                 LastResult = Get-LastResult
                 Latest     = $(try { Get-LatestRelease } catch { $null })
             }
@@ -1318,13 +1687,30 @@ function Show-Gui {
         if (-not $r.Url) { Show-Msg (T 'msg.nourl' $r.Version) 'Warning'; return }
         $text = T 'ask.download' $r.Version
         if (-not $r.Common) { $text = (T 'ask.download.warn' $r.Version) + $text }
+        $partial = Get-PartialDownload $r.Version
+        if ($partial -gt 0) { $text += "`n`n" + (T 'ask.download.resume' ($partial / 1MB)) }
         if (-not (Ask $text)) { return }
         Start-Work (T 'prog.downloading' $r.Version) { param($v, $u) Import-Version $v $u } @($r.Version, $r.Url) {
             param($res, $err)
-            if ($err) { Show-Msg (T 'msg.verifyfail' $err) 'Warning' }
+            if ($err -eq (T 'err.cancelled')) { Show-Msg (T 'msg.cancelled') }
+            elseif ($err) { Show-Msg (T 'msg.verifyfail' $err) 'Warning' }
             else { Show-Msg (T 'msg.verified') }
             Invoke-Refresh
-        }
+        } -Cancellable $true
+    })
+
+    $btnCancelWork.Add_Click({
+        if (-not $sync.Busy) { return }
+        $sync.Cancel = $true
+        $btnCancelWork.Enabled = $false; $btnCancelWork.Text = T 'ui.cancelling'
+    })
+
+    $cbWu.Add_SelectedIndexChanged({
+        $new = $wuModes[$cbWu.SelectedIndex]
+        try { Set-Setting 'WuDrivers' $new } catch { }
+        try { [void](Set-WuDriverLock (Get-WuDriverLockWanted $new)) }
+        catch { Show-Msg (T 'msg.failed' $_.Exception.Message) 'Warning' }
+        if ($ui.State) { $ui.State.Wu = Get-WuDriverLock; Update-View }
     })
 
     $btnSwitch.Add_Click({

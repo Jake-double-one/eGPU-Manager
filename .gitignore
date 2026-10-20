@@ -5,6 +5,9 @@ config.json
 Packages/
 Pakete/
 
+# Replaced script versions with config snapshots (written by the updater)
+Archive/
+
 # Working files
 *.log
 *.tmp

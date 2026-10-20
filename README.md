@@ -24,12 +24,15 @@ With **the same version for both cards**, the A2000 and the 4070 run at the same
 - **Status** of both cards (driver version, device state) and of the NVIDIA packages in the Windows driver store
 - **Version list** straight from NVIDIA's driver search for both cards – shows which versions NVIDIA released for **both**
 - **Download and verify**: download, Authenticode signature (NVIDIA Corporation), archive test, both hardware IDs with the same driver version in the package, signed driver catalog
-- **Switch** now, at the next restart, or at a set time (one-time SYSTEM task that deletes itself afterwards)
+- Downloads are **resumable** (HTTP range, up to 5 attempts after a dropped connection) and can be **cancelled**; the partial file is kept and continued next time
+- **Switch** now, at the next restart, or at a set time (one-time SYSTEM task that deletes itself afterwards; wakes the laptop if it is asleep)
 - **Repair mismatch** when Dell Command Update or Windows Update replaced a driver
+- **Windows Update driver lock**: the setting *Windows Update drivers* (Automatic / Block / Allow) controls the policy `ExcludeWUDriversInQualityUpdate`. *Automatic* locks as soon as a version installed by this tool is active, so Windows Update can't put one card on a different version again
 - Keeps at most two versions (current + fallback) as the original installer; checksum and signature are verified again before every use
 - **Install tool**: copies itself to `C:\Scripts\GpuTool`, secures the folder, creates a desktop shortcut and restarts from there
-- **Updater**: checks this repository for a newer version tag and updates itself
+- **Updater**: checks this repository for a newer version tag and updates itself; replaced scripts are archived
 - English and German (automatic from the Windows display language), light and dark theme (automatic from Windows)
+- Log in `C:\ProgramData\GpuTool\gpu-tool.log`, rotated at 1 MB
 
 ## Requirements
 
@@ -55,7 +58,7 @@ Console:
 
 ## Updates
 
-The tool compares its version with the newest version tag (`vX.Y.Z`) in this repository. If a newer one exists, an **Update to X.Y.Z** button appears at the bottom. The new script is downloaded from that tag, syntax-checked and must carry the expected version number; the previous script is kept as `GpuTool.ps1.bak`. Settings and driver packages are kept.
+The tool compares its version with the newest version tag (`vX.Y.Z`) in this repository. If a newer one exists, an **Update to X.Y.Z** button appears at the bottom. The new script is downloaded from that tag, syntax-checked and must carry the expected version number. The previous script and a snapshot of `config.json` go to `Archive\<version>\`; settings and driver packages are kept.
 
 A git checkout (development copy) is not updated by the tool – use `git pull` there.
 
