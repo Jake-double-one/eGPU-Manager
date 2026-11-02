@@ -14,6 +14,7 @@
             GpuTool.ps1 -Apply 596.36      install a stored version now (administrator rights)
   Internal: -Apply <version> -FromTask     one-time scheduled switch, the task deletes itself afterwards
             -LoadCore                      load functions only (used by the GUI's background work)
+            -Lang en|de                    language for this run (the scheduled task passes the GUI's language)
 
   Files:    config.json, Packages\<version>\*.exe (original NVIDIA installer, verified before every use)
             Archive\<version>\ (every replaced script version with a config.json snapshot)
@@ -22,6 +23,8 @@
 
   Windows Update: the setting "Windows Update drivers" (Automatic / Block / Allow) controls the policy
             ExcludeWUDriversInQualityUpdate so Windows Update can't put one card on another version.
+  Remove:   "Remove tool" cancels a scheduled switch, lifts the Windows Update lock, deletes the shortcut,
+            C:\ProgramData\GpuTool and the installation folder. The installed NVIDIA driver stays.
 #>
 param(
     [string]$Apply,
@@ -35,7 +38,7 @@ param(
 )
 
 $Global:GT = @{
-    Version    = '1.2.0'
+    Version    = '1.3.0'
     Repo       = 'Jake-double-one/eGPU-Manager'
     AppName    = 'eGPU Manager'
     Self       = $PSCommandPath
@@ -59,6 +62,9 @@ $GT.WuPolicyKey  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
 $GT.WuPolicyName = 'ExcludeWUDriversInQualityUpdate'
 $GT.DownloadRetries = 5        # attempts per download (resumed with HTTP Range)
 $GT.DownloadRetryWait = 10     # seconds between attempts
+$GT.FreeMBDownload = 2048      # free space needed before a download: package (~900 MB) + extraction at install time
+$GT.FreeMBInstall  = 1536      # free space needed before a switch: the extracted Display.Driver folder
+$GT.UserAgent = "eGPU-Manager/$($GT.Version)"
 New-Item -ItemType Directory -Force -Path $GT.DataDir | Out-Null
 
 # =============================================================================================
@@ -84,6 +90,8 @@ $Global:GTStrings = @{
     # --- download / verify ---
     'prog.download'       = @('Download {0:N0} of {1:N0} MB', 'Download {0:N0} von {1:N0} MB')
     'prog.download.rate'  = @('Download {0:N0} of {1:N0} MB - {2:N1} MB/s - {3} left', 'Download {0:N0} von {1:N0} MB - {2:N1} MB/s - noch {3}')
+    'prog.download.open'  = @('Download {0:N0} MB - {1:N1} MB/s (size unknown)', 'Download {0:N0} MB - {1:N1} MB/s (Größe unbekannt)')
+    'err.diskspace'       = @('Not enough free space on {0}: {1:N0} MB free, about {2:N0} MB needed', 'Zu wenig freier Speicher auf {0}: {1:N0} MB frei, etwa {2:N0} MB nötig')
     'prog.download.wait'  = @('Connection lost - retrying in {0} s (attempt {1} of {2}) ...', 'Verbindung verloren - neuer Versuch in {0} s (Versuch {1} von {2}) ...')
     'log.resume'          = @('  Resuming download at {0:N0} MB', '  Setze Download bei {0:N0} MB fort')
     'log.retry'           = @('  Download interrupted ({0}) - retrying', '  Download unterbrochen ({0}) - neuer Versuch')
@@ -130,6 +138,8 @@ $Global:GTStrings = @{
     'log.removed'         = @('  removed {0} ({1}, {2}) -> exit {3}', '  entfernt {0} ({1}, {2}) -> Exit {3}')
     'prog.install'        = @('Installing {0} ...', 'Installiere {0} ...')
     'log.installed'       = @('  installed {0} -> exit {1}', '  installiert {0} -> Exit {1}')
+    'prog.scan'           = @('Scanning for hardware changes ...', 'Suche nach geänderter Hardware ...')
+    'log.scanned'         = @('  device rescan -> exit {0}', '  Geräte neu eingelesen -> Exit {0}')
     'msg.switchok'        = @('Both cards now use the shared version {0}.', 'Beide Karten nutzen jetzt die gemeinsame Version {0}.')
     'msg.switchreboot'    = @('Driver {0} is installed. Restart the laptop to complete the switch.', 'Treiber {0} ist installiert. Bitte den Laptop neu starten, um den Wechsel abzuschließen.')
     'msg.applyfail'       = @('Switch to {0} failed: {1}', 'Wechsel auf {0} fehlgeschlagen: {1}')
@@ -174,6 +184,13 @@ $Global:GTStrings = @{
     'err.update.parse'    = @('The downloaded script contains errors - update aborted', 'Das heruntergeladene Script enthält Fehler - Update abgebrochen')
     'err.update.version'  = @('The downloaded script has an unexpected version - update aborted', 'Das heruntergeladene Script hat eine unerwartete Version - Update abgebrochen')
 
+    # --- remove ---
+    'log.uninstall'       = @('Removing eGPU Manager', 'Entferne eGPU Manager')
+    'log.uninstall.dir'   = @('  deleted {0}', '  gelöscht: {0}')
+    'log.uninstall.later' = @('  {0} is deleted after the window closes', '  {0} wird nach dem Schließen des Fensters gelöscht')
+    'log.uninstall.lnk'   = @('  desktop shortcut removed', '  Desktop-Verknüpfung entfernt')
+    'log.uninstall.done'  = @('eGPU Manager removed', 'eGPU Manager entfernt')
+
     # --- console ---
     'con.store'           = @('Driver store', 'Treiberspeicher')
     'con.ok'              = @('OK: shared version {0}', 'OK: gemeinsame Version {0}')
@@ -214,6 +231,14 @@ $Global:GTStrings = @{
     'ui.reinstall'        = @('Recreate shortcut', 'Verknüpfung erneuern')
     'ui.tooldir'          = @('Open tool folder', 'Tool-Ordner öffnen')
     'ui.update'           = @('Update to {0}', 'Update auf {0}')
+    'ui.uninstall'        = @('Remove tool', 'Tool entfernen')
+    'prog.uninstall'      = @('Removing ...', 'Entferne ...')
+    'ask.uninstall'       = @("Remove eGPU Manager completely?`n`n- cancel a scheduled switch`n- lift the Windows Update driver lock`n- delete the desktop shortcut`n- delete {0} (log, work files){1}`n`nThe NVIDIA driver that is installed right now stays as it is.", "eGPU Manager vollständig entfernen?`n`n- geplanten Wechsel abbrechen`n- Windows-Update-Treibersperre aufheben`n- Desktop-Verknüpfung löschen`n- {0} löschen (Log, Arbeitsdateien){1}`n`nDer aktuell installierte NVIDIA-Treiber bleibt unverändert.")
+    'ask.uninstall.dir'   = @("`n- delete {0} (script, settings, driver packages, archive)", "`n- {0} löschen (Script, Einstellungen, Treiberpakete, Archiv)")
+    'ask.uninstall.keep'  = @("`n- the script in {0} is kept", "`n- das Script in {0} bleibt erhalten")
+    'msg.uninstalled'     = @("eGPU Manager has been removed. The window closes now.{0}", "eGPU Manager wurde entfernt. Das Fenster wird jetzt geschlossen.{0}")
+    'msg.uninstalled.dir' = @("`n`n{0} is deleted right after that.", "`n`n{0} wird direkt danach gelöscht.")
+    'msg.uninstallfail'   = @("Removal failed:`n`n{0}", "Entfernen fehlgeschlagen:`n`n{0}")
     'ui.dev'              = @('dev', 'dev')
     'st.ok'               = @('OK', 'OK')
     'st.disabled'         = @('disabled', 'deaktiviert')
@@ -334,13 +359,41 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Authenticode signature valid and issued to NVIDIA Corporation. The CN is matched as a whole
+# name ("CN=NVIDIA Corporation, O=..."), not as a prefix of a longer one.
+function Test-NvidiaSignature($Signature) {
+    [bool]($Signature -and $Signature.Status -eq 'Valid' -and
+           "$($Signature.SignerCertificate.Subject)" -match '(^|,\s*)CN=NVIDIA Corporation(\s*,|$)')
+}
+
+# Free bytes on the drive that holds a path, or $null when it can't be determined
+function Get-FreeSpace([string]$Path) {
+    try { (New-Object IO.DriveInfo([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($Path)))).AvailableFreeSpace } catch { $null }
+}
+
+# Throws when one of the drives behind the given folders has less than $NeedMB free
+function Assert-DiskSpace([int]$NeedMB, [string[]]$Paths) {
+    $seen = @{}
+    foreach ($p in $Paths) {
+        $root = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($p))
+        if ($seen.ContainsKey($root)) { continue }
+        $seen[$root] = $true
+        $free = Get-FreeSpace $p
+        if ($null -ne $free -and $free -lt ($NeedMB * 1MB)) { throw (T 'err.diskspace' $root ($free / 1MB) $NeedMB) }
+    }
+}
+
 function Get-Config {
     if (-not (Test-Path $GT.ConfigFile)) { Save-Config (New-DefaultConfig) }
     Get-Content $GT.ConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
+# Written to a temporary file first and renamed into place, so a crash or a second writer never
+# leaves a half-written config.json behind
 function Save-Config($Config) {
-    $Config | ConvertTo-Json -Depth 6 | Set-Content -Path $GT.ConfigFile -Encoding UTF8
+    $tmp = "$($GT.ConfigFile).tmp"
+    $Config | ConvertTo-Json -Depth 6 | Set-Content -Path $tmp -Encoding UTF8
+    Move-Item $tmp $GT.ConfigFile -Force
 }
 
 # Default configuration, used when only GpuTool.ps1 was copied without config.json
@@ -573,8 +626,9 @@ function Save-Download([string]$Url, [string]$Path) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $part = "$Path.part"
     $meta = "$Path.part.meta"
-    # a completed file that was never verified (interrupted earlier) is treated like a .part
-    if ((Test-Path $Path) -and -not (Test-Path $part)) { Move-Item $Path $part -Force }
+    # a complete file that was never verified (the run was interrupted between download and check) has no
+    # .meta and can't be matched against the server's file any more - discard it and start over
+    if ((Test-Path $Path) -and -not (Test-Path $part)) { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
 
     $attempt = 0
     $lastErr = $null
@@ -641,10 +695,7 @@ function Invoke-DownloadAttempt([string]$Url, [string]$Part, [string]$Meta) {
     if ($done -gt 0 -and (Test-Path $Meta)) { $tag = "$(Get-Content $Meta -Raw -ErrorAction SilentlyContinue)".Trim() }
     if ($done -gt 0 -and -not $tag) { return $false }   # partial file of unknown origin
 
-    $req = [Net.HttpWebRequest]::Create($Url)
-    $req.Timeout = 30000; $req.ReadWriteTimeout = 30000
-    $req.UserAgent = "eGPU-Manager/$($GT.Version)"
-    $req.AllowAutoRedirect = $true
+    $req = New-DownloadRequest $Url
     if ($done -gt 0) { $req.AddRange([int64]$done) }
 
     $resp = $null
@@ -652,7 +703,7 @@ function Invoke-DownloadAttempt([string]$Url, [string]$Part, [string]$Meta) {
     catch {
         if ((Get-WebStatus $_.Exception) -eq 416) {
             # range not satisfiable: either we already have everything or the file changed
-            $head = [Net.HttpWebRequest]::Create($Url); $head.Method = 'HEAD'; $head.Timeout = 30000
+            $head = New-DownloadRequest $Url 'HEAD'
             $hr = $head.GetResponse()
             try { $len = $hr.ContentLength; $htag = Get-ServerTag $hr $len } finally { $hr.Close() }
             if ($len -eq $done -and $htag -eq $tag) { Set-Progress 100 (T 'prog.download' ($done / 1MB) ($done / 1MB)); return $true }
@@ -667,7 +718,10 @@ function Invoke-DownloadAttempt([string]$Url, [string]$Part, [string]$Meta) {
         if ($done -gt 0) {
             if ($status -ne 206) { return $false }     # server ignored the range
             $cr = "$($resp.Headers['Content-Range'])"
-            $total = if ($cr -match '/(\d+)\s*$') { [int64]$Matches[1] } else { $done + $resp.ContentLength }
+            # total from Content-Range; without it from Content-Length, and -1 (unknown) when that is missing too
+            $total = if ($cr -match '/(\d+)\s*$') { [int64]$Matches[1] }
+                     elseif ($resp.ContentLength -ge 0) { $done + $resp.ContentLength }
+                     else { [int64]-1 }
             if ((Get-ServerTag $resp $total) -ne $tag) { return $false }   # file changed on the server
             Write-Log (T 'log.resume' ($done / 1MB))
         } else {
@@ -692,9 +746,13 @@ function Invoke-DownloadAttempt([string]$Url, [string]$Part, [string]$Meta) {
                 while ($window.Count -gt 1 -and ($now - $window.Peek()[0]) -gt 5) { [void]$window.Dequeue() }
                 $first = $window.Peek()
                 $rate  = if ($now - $first[0] -gt 0) { ($done - $first[1]) / ($now - $first[0]) } else { 0 }
-                $left  = if ($rate -gt 0) { Format-Duration (($total - $done) / $rate) } else { '?' }
-                $pct   = [int](100 * $done / [Math]::Max(1, $total))
-                Set-Progress $pct (T 'prog.download.rate' ($done / 1MB) ($total / 1MB) ($rate / 1MB) $left)
+                if ($total -gt 0) {
+                    $left = if ($rate -gt 0) { Format-Duration (($total - $done) / $rate) } else { '?' }
+                    $pct  = [int][Math]::Min(100, 100 * $done / $total)
+                    Set-Progress $pct (T 'prog.download.rate' ($done / 1MB) ($total / 1MB) ($rate / 1MB) $left)
+                } else {
+                    Set-Progress -1 (T 'prog.download.open' ($done / 1MB) ($rate / 1MB))   # size unknown: marquee
+                }
             }
         }
     } finally {
@@ -706,6 +764,16 @@ function Invoke-DownloadAttempt([string]$Url, [string]$Part, [string]$Meta) {
     if ($done -lt $total) { throw (T 'err.incomplete' $done $total) }   # connection closed early -> retry resumes
     if ($done -gt $total) { return $false }
     $true
+}
+
+# GET or HEAD request with the timeouts and the User-Agent every download uses
+function New-DownloadRequest([string]$Url, [string]$Method = 'GET') {
+    $req = [Net.HttpWebRequest]::Create($Url)
+    $req.Method = $Method
+    $req.Timeout = 30000; $req.ReadWriteTimeout = 30000
+    $req.UserAgent = $GT.UserAgent
+    $req.AllowAutoRedirect = $true
+    $req
 }
 
 # ETag (preferred), Last-Modified or at least the total size of a response, used to notice a changed file
@@ -724,9 +792,7 @@ function Test-Package([string]$Exe) {
 
     Set-Progress -1 (T 'prog.sig')
     $sig = Get-AuthenticodeSignature $Exe
-    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=NVIDIA Corporation') {
-        throw (T 'err.sig' $sig.Status $sig.SignerCertificate.Subject)
-    }
+    if (-not (Test-NvidiaSignature $sig)) { throw (T 'err.sig' $sig.Status $sig.SignerCertificate.Subject) }
     Write-Log (T 'log.sigok')
 
     Set-Progress -1 (T 'prog.archive')
@@ -762,6 +828,8 @@ function Import-Version([string]$Version, [string]$Url) {
     Write-Log (T 'log.import' $Version)
     $name = [IO.Path]::GetFileName(([uri]$Url).AbsolutePath)
     if ($name -notmatch '^[\w.\-]+\.exe$') { throw (T 'err.nourl' $Version) }
+    # enough room for the package and, later, its extraction? (what is already in the .part counts)
+    Assert-DiskSpace ($GT.FreeMBDownload - [int]((Get-PartialDownload $Version) / 1MB)) @($GT.WorkDir, $GT.PkgDir)
     # the download folder survives failed and cancelled attempts so the .part can be resumed
     $tmp  = Join-Path $GT.WorkDir "download-$Version"
     New-Item -ItemType Directory -Force -Path $tmp | Out-Null
@@ -838,12 +906,12 @@ function Install-Version([string]$Version) {
     Set-Progress -1 (T 'prog.pkg')
     if (-not (Test-Path $exe)) { throw (T 'err.pkgmissing' $exe) }
     if ((Get-FileHash $exe).Hash -ne $pkg.Sha256) { throw (T 'err.hash') }
-    $sig = Get-AuthenticodeSignature $exe
-    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'CN=NVIDIA Corporation') { throw (T 'err.sigshort') }
+    if (-not (Test-NvidiaSignature (Get-AuthenticodeSignature $exe))) { throw (T 'err.sigshort') }
     Write-Log (T 'log.pkgok')
 
     # extract the driver part
     Set-Progress -1 (T 'prog.extract')
+    Assert-DiskSpace $GT.FreeMBInstall @($GT.WorkDir)
     $x = Join-Path $GT.WorkDir "install-$Version"
     Remove-Item $x -Recurse -Force -ErrorAction SilentlyContinue
     & $GT.SevenZip x $exe "-o$x" 'Display.Driver\*' -y | Out-Null
@@ -869,6 +937,11 @@ function Install-Version([string]$Version) {
             if ($LASTEXITCODE -eq 3010) { $reboot = $true }
             elseif ($LASTEXITCODE -notin 0, 259) { Write-Log "    $($out -join ' ')" }   # 259 = no device updated
         }
+        # 3. re-enumerate: a card left with code 31/43 often starts right away once Windows looks at it again
+        Set-Progress -1 (T 'prog.scan')
+        $out = & pnputil.exe /scan-devices 2>&1
+        Write-Log (T 'log.scanned' $LASTEXITCODE)
+        if ($LASTEXITCODE -ne 0) { Write-Log "    $($out -join ' ')" }
     } finally { Remove-Item $x -Recurse -Force -ErrorAction SilentlyContinue }
 
     $cfg = Get-Config
@@ -915,7 +988,8 @@ function Protect-Folder([string]$Path = $GT.Root) {
 function Register-Switch([string]$Version, $At) {
     Assert-NvVersionString $Version   # the version becomes part of a SYSTEM command line
     if (-not (Test-FolderSecure)) { throw (T 'err.notsecure' $GT.Root) }
-    $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($GT.Self)`" -Apply $Version -FromTask"
+    # -Lang: the task runs as SYSTEM, whose Windows language may differ from the user's - pass the GUI's language along
+    $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$($GT.Self)`" -Apply $Version -FromTask -Lang $($GT.Lang)"
     $act = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument $arg
     if ($At) { $trg = New-ScheduledTaskTrigger -Once -At $At }
     else     { $trg = New-ScheduledTaskTrigger -AtStartup; $trg.Delay = 'PT1M' }
@@ -1059,7 +1133,7 @@ function Install-Tool {
 # Newest release = highest version tag (vX.Y.Z) in the GitHub repository
 function Get-LatestRelease {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $tags = Invoke-RestMethod -UseBasicParsing -TimeoutSec 15 -Headers @{ 'User-Agent' = 'eGPU-Manager' } `
+    $tags = Invoke-RestMethod -UseBasicParsing -TimeoutSec 15 -Headers @{ 'User-Agent' = $GT.UserAgent } `
         -Uri "https://api.github.com/repos/$($GT.Repo)/tags?per_page=100"
     $best = $null
     foreach ($t in @($tags)) {
@@ -1095,6 +1169,38 @@ function Update-Script([string]$Tag, [string]$Version) {
     Remove-Item $tmp -ErrorAction SilentlyContinue
     Write-Log (T 'log.updated' $Version $backup)
     $GT.Self
+}
+
+# Removes everything the tool put on this machine: the scheduled switch, the Windows Update driver lock,
+# the desktop shortcut, C:\ProgramData\GpuTool and the installation folder. The NVIDIA driver stays.
+# A git checkout is never deleted. The running script can't delete its own folder, so the installation
+# folder is emptied now and removed by the GUI a few seconds after the window has closed.
+# Returns the folder that still has to be removed that way, or $null.
+function Uninstall-Tool {
+    if (-not (Test-Admin)) { throw (T 'err.admin') }
+    Write-Log (T 'log.uninstall')
+    Unregister-ScheduledTask -TaskName $GT.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    try { [void](Set-WuDriverLock $false) } catch { Write-Log (T 'log.error' $_.Exception.Message) }
+    $desk = [Environment]::GetFolderPath('Desktop')
+    foreach ($n in 'eGPU Manager.lnk', 'GPU-Verwaltung.lnk') { Remove-Item (Join-Path $desk $n) -Force -ErrorAction SilentlyContinue }
+    Write-Log (T 'log.uninstall.lnk')
+
+    $later = $null
+    $dir   = $GT.InstallDir
+    if ((Test-Path $dir) -and -not (Test-Path (Join-Path $dir '.git'))) {
+        $self = [IO.Path]::GetFullPath($GT.Self)
+        foreach ($item in @(Get-ChildItem $dir -Force)) {
+            if ([IO.Path]::GetFullPath($item.FullName) -eq $self) { continue }
+            Remove-Item $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log (T 'log.uninstall.dir' $item.FullName)
+        }
+        $later = $dir
+        Write-Log (T 'log.uninstall.later' $dir)
+    }
+    Write-Log (T 'log.uninstall.done')
+    # the data folder goes last - the log lives there
+    Remove-Item $GT.DataDir -Recurse -Force -ErrorAction SilentlyContinue
+    $later
 }
 
 # =============================================================================================
@@ -1232,8 +1338,11 @@ function Show-Gui {
         [void]$cb.Items.AddRange($Items); $cb.SelectedIndex = $Selected
         $cb
     }
-    function Ask([string]$Text) {
-        [Windows.Forms.MessageBox]::Show($form, $Text, $GT.AppName, 'YesNo', 'Question') -eq 'Yes'
+    # $DefaultNo: destructive questions start on "No" so a stray Enter doesn't confirm them
+    function Ask([string]$Text, [bool]$DefaultNo = $false) {
+        $icon = if ($DefaultNo) { 'Warning' } else { 'Question' }
+        $def  = if ($DefaultNo) { 'Button2' } else { 'Button1' }
+        [Windows.Forms.MessageBox]::Show($form, $Text, $GT.AppName, 'YesNo', $icon, $def) -eq 'Yes'
     }
     function Show-Msg([string]$Text, [string]$Icon = 'Information') {
         [void][Windows.Forms.MessageBox]::Show($form, $Text, $GT.AppName, 'OK', $Icon)
@@ -1428,9 +1537,10 @@ function Show-Gui {
     $btnUpdate  = New-Button ''
     $btnUpdate.Visible = $false; $btnUpdate.Font = $fontBold
     $btnInstall = New-Button $(if (Test-Installed) { T 'ui.reinstall' } else { T 'ui.install' })
+    $btnUninstall = New-Button (T 'ui.uninstall')
     $btnToolDir = New-Button (T 'ui.tooldir')
     $btnToolDir.Margin = New-Object Windows.Forms.Padding(0, 3, 0, 3)
-    $flRight.Controls.AddRange(@($lblVersion, $lnkRepo, $btnUpdate, $btnInstall, $btnToolDir))
+    $flRight.Controls.AddRange(@($lblVersion, $lnkRepo, $btnUpdate, $btnInstall, $btnUninstall, $btnToolDir))
 
     $tlSettings.Controls.Add($flLeft, 0, 0)
     $tlSettings.Controls.Add($flRight, 0, 1)
@@ -1442,7 +1552,8 @@ function Show-Gui {
     # ---------- background work ----------
     function Set-Busy([bool]$Busy, [bool]$Cancellable = $false) {
         foreach ($b in $ui.Buttons) { $b.Enabled = -not $Busy }
-        $chkAll.Enabled = -not $Busy; $cbLang.Enabled = -not $Busy; $cbWu.Enabled = -not $Busy
+        # the combo boxes write config.json on the GUI thread - never while background work may write it too
+        $chkAll.Enabled = -not $Busy; $cbLang.Enabled = -not $Busy; $cbWu.Enabled = -not $Busy; $cbTheme.Enabled = -not $Busy
         $btnCancelWork.Visible = ($Busy -and $Cancellable); $btnCancelWork.Enabled = $true; $btnCancelWork.Text = T 'ui.cancel'
         if ($Busy) { $progress.Style = 'Marquee' }
         else { $progress.Style = 'Continuous'; $progress.Value = 0; $lblProgress.Text = '' }
@@ -1689,6 +1800,9 @@ function Show-Gui {
         if (-not $r.Common) { $text = (T 'ask.download.warn' $r.Version) + $text }
         $partial = Get-PartialDownload $r.Version
         if ($partial -gt 0) { $text += "`n`n" + (T 'ask.download.resume' ($partial / 1MB)) }
+        # room for the package and its later extraction? (checked again inside Import-Version)
+        try { Assert-DiskSpace ($GT.FreeMBDownload - [int]($partial / 1MB)) @($GT.WorkDir, $GT.PkgDir) }
+        catch { Show-Msg $_.Exception.Message 'Warning'; return }
         if (-not (Ask $text)) { return }
         Start-Work (T 'prog.downloading' $r.Version) { param($v, $u) Import-Version $v $u } @($r.Version, $r.Url) {
             param($res, $err)
@@ -1791,6 +1905,25 @@ function Show-Gui {
             param($res, $err)
             if ($err) { Show-Msg (T 'msg.installfail' $err) 'Error'; return }
             Restart-Tool $res   # administrator rights are inherited
+        }
+    })
+
+    $btnUninstall.Add_Click({
+        $extra = ''
+        if ((Test-Path $GT.InstallDir) -and -not (Test-Path (Join-Path $GT.InstallDir '.git'))) { $extra += T 'ask.uninstall.dir' $GT.InstallDir }
+        if (-not (Test-Installed) -or (Test-DevCopy)) { $extra += T 'ask.uninstall.keep' $GT.Root }
+        if (-not (Ask (T 'ask.uninstall' $GT.DataDir $extra) $true)) { return }
+        Start-Work (T 'prog.uninstall') { Uninstall-Tool } @() {
+            param($res, $err)
+            if ($err) { Show-Msg (T 'msg.uninstallfail' $err) 'Error'; Invoke-Refresh; return }
+            Show-Msg (T 'msg.uninstalled' $(if ($res) { T 'msg.uninstalled.dir' $res } else { '' }))
+            if ($res) {
+                # the folder with the running script (it is this process's working directory): removed by a
+                # detached cmd.exe about 5 s later, when this process is gone; the parent (C:\Scripts) only if empty
+                $parent = Split-Path $res
+                Start-Process cmd.exe -WindowStyle Hidden -ArgumentList "/c ping -n 6 127.0.0.1 >nul & rd /s /q `"$res`" & rd `"$parent`" 2>nul"
+            }
+            $form.Close()
         }
     })
 
